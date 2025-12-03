@@ -1,0 +1,82 @@
+# ============================================================================
+# Python .gitignore for PDF_Parsing Project
+# ============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+myvenv/
+venv/
+ENV/
+env/
+.venv/
+
+# Environment variables (IMPORTANT - contains API keys!)
+.env
+*.env
+config.py
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Test/Mock data (optional - uncomment to exclude)
+# mock_documents/
+# mock_cloud/
+
+# Unused backup files
+mock_storage_backup.py
+mock_cloud/
+
+# Output folders
+lob/
+output/
+exports/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Excel output files
+*.xlsx
+*.xls
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# ============================================================================
+# Files to KEEP (not ignored):
+# ============================================================================
+# app.py                 - Main Streamlit application
+# email_agent.py         - LangGraph agent for extraction
+# google_ai_parser.py    - OpenAI PDF parsing logic
+# mock_storage.py        - Mock storage for testing
+# cloud_storage.py       - Azure/OneDrive storage provider
+# app_ui.py              - Alternative UI (if used)
+# requirements.txt       - Python dependencies
+# .streamlit/config.toml - Streamlit theme config
+# README.md              - Documentation (if exists)
+# ============================================================================

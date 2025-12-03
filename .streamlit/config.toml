@@ -1,0 +1,19 @@
+[theme]
+# EXL Theme Colors
+primaryColor = "#1E3A8A"          # EXL Blue - buttons, links
+backgroundColor = "#d6d3d1"        # Light stone/gray background
+secondaryBackgroundColor = "#F1F5F9"  # Light gray for sidebar/cards
+textColor = "#0752cbff"              # Dark slate text
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"

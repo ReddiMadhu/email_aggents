@@ -1,0 +1,20 @@
+streamlit>=1.28.0
+openai>=1.30.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
+langchain>=0.1.0
+langchain-google-genai>=0.0.5
+langgraph>=0.0.10
+pydantic>=2.0.0
+python-dotenv
+fpdf
+requests>=2.31.0
+
+# Azure Blob Storage
+azure-storage-blob>=12.19.0
+
+# Microsoft Graph API (OneDrive)
+msal>=1.24.0
+
+
