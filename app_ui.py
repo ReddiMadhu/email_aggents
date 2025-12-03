@@ -65,6 +65,9 @@ if 'parse_results' not in st.session_state:
 if 'email_status' not in st.session_state:
     st.session_state.email_status = None
 
+if 'extraction_success' not in st.session_state:
+    st.session_state.extraction_success = False
+
 # ============================================================================
 # AI Extraction Function
 # ============================================================================
@@ -73,29 +76,44 @@ def extract_from_query(query: str) -> Dict:
     """Use the LangGraph agent to extract information from natural language query."""
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        from langchain_core.prompts import ChatPromptTemplate
-        from langchain_core.output_parsers import JsonOutputParser
         from pydantic import BaseModel, Field
         
         if not os.getenv("GOOGLE_API_KEY"):
             st.error("❌ GOOGLE_API_KEY not found in environment variables.")
             return {}
         
+        # Pydantic model for structured output
         class ExtractedInfo(BaseModel):
-            account_name: Optional[str] = Field(description="Account/Company name")
-            lob: Optional[str] = Field(description="Line of Business (AUTO, PROPERTY, GL, WC)")
-            policy_number: Optional[str] = Field(description="Policy or claim number")
-            start_date: Optional[str] = Field(description="Start date in DD-MM-YYYY format")
-            end_date: Optional[str] = Field(description="End date in DD-MM-YYYY format")
+            """Extracted search criteria from user query."""
+            account_name: Optional[str] = Field(
+                default=None, 
+                description="Account/Company name. Must be one of: Amex, Chubbs, GlobalInsure, TechCorp, Travelers"
+            )
+            lob: Optional[str] = Field(
+                default=None, 
+                description="Line of Business. Must be one of: AUTO, PROPERTY, GL, WC"
+            )
+            policy_number: Optional[str] = Field(
+                default=None, 
+                description="Policy or claim number (numeric identifier)"
+            )
+            start_date: Optional[str] = Field(
+                default=None, 
+                description="Start date in DD-MM-YYYY format"
+            )
+            end_date: Optional[str] = Field(
+                default=None, 
+                description="End date in DD-MM-YYYY format"
+            )
         
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-        parser = JsonOutputParser(pydantic_object=ExtractedInfo)
+        # Initialize LLM with structured output
+        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+        structured_llm = llm.with_structured_output(ExtractedInfo)
         
         accounts_list = ", ".join(VALID_ACCOUNTS)
         lobs_list = ", ".join(VALID_LOBS)
         
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are an expert at extracting insurance document search criteria from natural language.
+        system_prompt = f"""You are an expert at extracting insurance document search criteria from natural language.
 
 **Valid Account Names:** {accounts_list}
 **Valid Lines of Business (LoB):** {lobs_list}
@@ -116,26 +134,32 @@ def extract_from_query(query: str) -> Dict:
 
 3. **Policy Number**: Extract numeric identifiers.
 
-4. **Date Range**: Extract start_date and end_date.
+4. **Date Range**: Extract start_date and end_date in DD-MM-YYYY format.
    - "2024-2025" → start_date: "01-01-2024", end_date: "31-12-2025"
-   - "less than 2024" → start_date: null, end_date: "31-12-2024"
-   - "after 2023" → start_date: "01-01-2024", end_date: null
+   - "less than 2024" → start_date: None, end_date: "31-12-2024"
+   - "after 2023" → start_date: "01-01-2024", end_date: None
    - "between Sep 2024 and Dec 2024" → start_date: "01-09-2024", end_date: "31-12-2024"
-   - Specific date → both start and end same
 
-Return JSON only. Use null for missing fields.
+Return None for any field that cannot be determined from the query."""
 
-{{format_instructions}}"""),
-            ("user", "{query}")
-        ])
+        # Invoke structured output
+        from langchain_core.messages import SystemMessage, HumanMessage
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query)
+        ]
         
-        chain = prompt | llm | parser
-        result = chain.invoke({"query": query, "format_instructions": parser.get_format_instructions()})
+        result: ExtractedInfo = structured_llm.invoke(messages)
         
-        return result
+        # Convert Pydantic model to dict
+        extracted_dict = result.model_dump()
+        print("Extraction result:", extracted_dict)
+        return extracted_dict
         
     except Exception as e:
         st.error(f"Extraction error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 def parse_date_string(date_str: str) -> Optional[date]:
@@ -251,7 +275,8 @@ with col_extract:
                         'start_date': extracted.get('start_date'),
                         'end_date': extracted.get('end_date')
                     }
-                    st.success("✅ Extracted successfully!")
+                    st.session_state.extraction_success = True
+                    st.rerun()  # Rerun to update dropdowns with extracted values
                 else:
                     st.warning("Could not extract information. Please fill manually.")
 
@@ -276,49 +301,60 @@ st.markdown("---")
 
 st.subheader("📋 Search Filters (Editable)")
 
+# Update widget keys directly from extracted data (before widgets render)
+if st.session_state.extraction_success:
+    extracted = st.session_state.extracted_data
+    
+    # Update Account dropdown key
+    if extracted.get('account_name') and extracted['account_name'] in VALID_ACCOUNTS:
+        st.session_state['account_select'] = extracted['account_name']
+    
+    # Update LOB dropdown key
+    if extracted.get('lob'):
+        lob_upper = extracted['lob'].upper()
+        if lob_upper in VALID_LOBS:
+            st.session_state['lob_select'] = lob_upper
+    
+    # Update Policy input key
+    if extracted.get('policy_number'):
+        st.session_state['policy_input'] = extracted['policy_number']
+    
+    # Update Date input keys
+    start_date_val = parse_date_string(extracted.get('start_date') or "")
+    if start_date_val:
+        st.session_state['start_date_input'] = start_date_val
+    
+    end_date_val = parse_date_string(extracted.get('end_date') or "")
+    if end_date_val:
+        st.session_state['end_date_input'] = end_date_val
+    
+    st.session_state.extraction_success = False  # Reset flag
+    st.success("✅ Extracted successfully! Filters have been auto-filled.")
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
     # Account dropdown
     account_options = ["-- Select --"] + VALID_ACCOUNTS
-    default_account = 0
-    if st.session_state.extracted_data.get('account_name'):
-        try:
-            default_account = account_options.index(st.session_state.extracted_data['account_name'])
-        except ValueError:
-            default_account = 0
-    
     selected_account = st.selectbox(
         "Account Name",
         options=account_options,
-        index=default_account,
         key="account_select"
     )
 
 with col2:
     # LOB dropdown
     lob_options = ["-- Select --"] + VALID_LOBS
-    default_lob = 0
-    if st.session_state.extracted_data.get('lob'):
-        lob_upper = st.session_state.extracted_data['lob'].upper()
-        try:
-            default_lob = lob_options.index(lob_upper)
-        except ValueError:
-            default_lob = 0
-    
     selected_lob = st.selectbox(
         "Line of Business",
         options=lob_options,
-        index=default_lob,
         key="lob_select"
     )
 
 with col3:
     # Policy number
-    default_policy = st.session_state.extracted_data.get('policy_number') or ""
     policy_number = st.text_input(
         "Policy Number",
-        value=default_policy,
         key="policy_input"
     )
 
@@ -326,18 +362,16 @@ with col3:
 col_date1, col_date2 = st.columns(2)
 
 with col_date1:
-    start_date_default = parse_date_string(st.session_state.extracted_data.get('start_date') or "")
     start_date = st.date_input(
         "Start Date",
-        value=start_date_default,
+        value=None,
         key="start_date_input"
     )
 
 with col_date2:
-    end_date_default = parse_date_string(st.session_state.extracted_data.get('end_date') or "")
     end_date = st.date_input(
         "End Date",
-        value=end_date_default,
+        value=None,
         key="end_date_input"
     )
 
