@@ -1,1285 +1,1030 @@
-#!/usr/bin/env python3
 """
-Streamlit App for Claims PDF Parsing
-Upload PDF files, extract claims data using AI, and download as Excel
+EXL Claims Document Manager
+===========================
+Streamlit app for AI-powered insurance document processing.
+
+Features:
+1. Upload PDFs and extract claims data
+2. Natural language document search
+3. Document preview and email sending
+4. Export results to Excel
 """
 
-import io
-import json
 import os
-import time
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List
+import io
+from datetime import datetime, date
+from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+import dotenv
 
+dotenv.load_dotenv()
+
+# Import utilities
+from utils.pdf_utils import extract_text_from_pdf, preview_pdf
+from utils.ai_parser import classify_lobs, extract_fields_chunked
+
+# Import storage and email
 try:
-    from openai import OpenAI
+    import cloud_storage as storage
 except ImportError:
-    st.error("Please install openai: pip install openai>=1.30.0")
-    st.stop()
+    import mock_storage as storage
 
-try:
-    import pdfplumber
-except ImportError:
-    st.error("Please install pdfplumber: pip install pdfplumber")
-    st.stop()
+from email_agent import send_email_action, VALID_ACCOUNTS, VALID_LOBS, LOB_EMAILS
 
-# ============================================================================
-# Configuration Functions
-# ============================================================================
+# =============================================================================
+# API Setup - Use Google Gemini by default
+# =============================================================================
 
-def load_config(config_file: str = "config.py") -> Dict[str, str]:
-    """Load configuration from config.py file"""
-    config_path = Path(config_file)
-    if not config_path.exists():
+def get_google_api_key() -> Optional[str]:
+    """Get Google API key from environment."""
+    return os.getenv("GOOGLE_API_KEY")
+
+def setup_gemini_client():
+    """Setup Google Gemini client."""
+    api_key = get_google_api_key()
+    if not api_key:
         return None
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("config", config_path)
-        config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(config_module)
-        cfg = {}
-        cfg['use_azure'] = getattr(config_module, 'USE_AZURE_OPENAI', False)
-        cfg['openai_api_key'] = getattr(config_module, 'OPENAI_API_KEY', None)
-        cfg['openai_model'] = getattr(config_module, 'OPENAI_MODEL', 'gpt-4o-2024-08-06')
-        cfg['azure_endpoint'] = getattr(config_module, 'AZURE_OPENAI_ENDPOINT', None)
-        cfg['azure_api_key'] = getattr(config_module, 'AZURE_OPENAI_API_KEY', None)
-        cfg['azure_deployment'] = getattr(config_module, 'AZURE_OPENAI_DEPLOYMENT_NAME', None)
-        
-        if cfg['use_azure']:
-            missing = [k for k in ['azure_endpoint', 'azure_api_key', 'azure_deployment'] if not cfg[k]]
-            if missing:
-                return None
-        else:
-            if not cfg['openai_api_key']:
-                return None
-        return cfg
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        return genai
     except Exception:
         return None
 
+def get_model_name() -> str:
+    """Get the default model name."""
+    return "gemini-2.0-flash"
 
-def setup_openai_client(cfg: Dict[str, str]):
-    """Setup OpenAI client based on configuration"""
-    try:
-        if cfg['use_azure']:
-            client = OpenAI(
-                api_key=cfg['azure_api_key'],
-                base_url=f"{cfg['azure_endpoint'].rstrip('/')}/openai/deployments/{cfg['azure_deployment']}",
-            )
-            return client
-        else:
-            client = OpenAI(api_key=cfg['openai_api_key'])
-            return client
-    except Exception:
-        return None
+# =============================================================================
+# Page Configuration
+# =============================================================================
 
+st.set_page_config(
+    page_title="EXL Claims Document Manager",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ============================================================================
-# PDF Text Extraction
-# ============================================================================
+# =============================================================================
+# Custom CSS - Clean Modern Theme
+# =============================================================================
 
-def extract_text_from_pdf(pdf_file) -> str:
-    """Extract text content from uploaded PDF file"""
-    text_content = []
-    try:
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text_content.append(page_text)
-                
-                # Also try to extract tables
-                tables = page.extract_tables()
-                for table in tables:
-                    if table:
-                        for row in table:
-                            if row:
-                                row_text = " | ".join([str(cell) if cell else "" for cell in row])
-                                text_content.append(row_text)
-    except Exception as e:
-        st.error(f"Error extracting text from PDF: {e}")
-        return ""
-    
-    return "\n".join(text_content)
-
-
-# ============================================================================
-# AI Processing Functions
-# ============================================================================
-
-def _chunk_text(text: str, max_chars: int = 15000, overlap_chars: int = 800) -> List[str]:
-    """Split text into chunks for processing"""
-    chunks: List[str] = []
-    if not text:
-        return chunks
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + max_chars, n)
-        if end < n:
-            nl = text.rfind("\n", start, end)
-            if nl != -1 and nl > start + 1000:
-                end = nl
-        chunks.append(text[start:end])
-        if end >= n:
-            break
-        start = max(0, end - overlap_chars)
-    return chunks
-
-
-def classify_lobs_multi_openai(client, model: str, text: str) -> List[str]:
-    """Classify Lines of Business from text content"""
-    prompt = f"""
-You are an insurance domain expert. Determine ALL Lines of Business (LoBs) present in the content.
-Choose any that apply from exactly these values: AUTO, GENERAL LIABILITY, WC, PROPERTY.
-Return STRICT JSON ONLY with no commentary and no markdown. Use double quotes and valid JSON.
-Schema: {{"lobs": ["AUTO"|"GENERAL LIABILITY"|"WC"|"PROPERTY", ...]}}
-Content:\n{text[:10000]}
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
-        content = resp.choices[0].message.content
-        obj = json.loads(content)
-        lobs = obj.get('lobs') or []
-        out = []
-        for v in lobs:
-            s = str(v).strip().upper()
-            if s in {"AUTO", "GENERAL LIABILITY", "WC", "PROPERTY"} and s not in out:
-                out.append(s)
-        if out:
-            return out
-    except Exception:
-        pass
-    
-    # Fallback heuristic
-    t = text.upper()
-    found = []
-    if any(k in t for k in [" AUTO ", " AUTOMOBILE", " VEHICLE", " VIN ", " COLLISION", " COMPREHENSIVE", " LICENSE PLATE"]):
-        found.append("AUTO")
-    if any(k in t for k in [" GENERAL LIABILITY", " GL ", " PREMISES", " PRODUCTS LIABILITY", " CGL "]):
-        found.append("GENERAL LIABILITY")
-    if any(k in t for k in [" WORKERS' COMP", " WORKERS COMP", " WC ", " TTD", " TPD", " INDEMNITY"]):
-        found.append("WC")
-    if any(k in t for k in [" PROPERTY ", " DWELLING", " BUILDING", " CONTENTS", " FIRE", " THEFT"]):
-        found.append("PROPERTY")
-    return found or ["AUTO"]
-
-
-def extract_fields_openai(client, model: str, text: str, lob: str) -> Dict:
-    """Extract structured fields from text for a specific LoB"""
-    lob = lob.upper()
-    if lob == 'AUTO':
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "paid_loss": "string",
-                "reserve": "string",
-                "alae": "string"
-            }]
-        }
-    elif lob == 'PROPERTY':
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "paid_loss": "string",
-                "reserve": "string",
-                "alae": "string"
-            }]
-        }
-    elif lob in ('GENERAL LIABILITY', 'GL'):
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "bi_paid_loss": "string",
-                "pd_paid_loss": "string",
-                "bi_reserve": "string",
-                "pd_reserve": "string",
-                "alae": "string"
-            }]
-        }
-    else:  # WC
-        schema = {
-            "evaluation_date": "string",
-            "carrier": "string",
-            "claims": [{
-                "claim_number": "string",
-                "loss_date": "string",
-                "Indemnity_paid_loss": "string",
-                "Medical_paid_loss": "string",
-                "Indemnity_reserve": "string",
-                "Medical_reserve": "string",
-                "ALAE": "string"
-            }]
-        }
-        lob = 'WC'
-
-    prompt = f"""
-Extract structured fields from the content for LoB={lob}.
-Return STRICT JSON ONLY matching this schema with no commentary and no markdown fences:
-{schema}
-Rules: ISO dates if possible; keep amounts/strings as-is; empty string if missing; preserve row order.
-IMPORTANT: Extract the carrier/company name from the content. This is critical.
-
-Content:\n{text}
-"""
-    max_attempts = 3
-    delay_seconds = 1.0
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=16000,
-                response_format={"type": "json_object"}
-            )
-            content = resp.choices[0].message.content
-            obj = json.loads(content)
-            if isinstance(obj, dict) and 'claims' in obj and isinstance(obj['claims'], list):
-                obj.setdefault('evaluation_date', '')
-                obj.setdefault('carrier', '')
-                return obj
-        except Exception:
-            if attempt == max_attempts:
-                break
-            time.sleep(delay_seconds)
-            delay_seconds *= 2
-            continue
-    return {"evaluation_date": "", "carrier": "", "claims": []}
-
-
-def extract_fields_openai_chunked(client, model: str, text: str, lob: str, progress_callback=None) -> Dict:
-    """Extract fields with chunking for long documents"""
-    chunks = _chunk_text(text)
-    if not chunks:
-        chunks = [text]
-    
-    merged = {"evaluation_date": "", "carrier": "", "claims": []}
-    for idx, part in enumerate(chunks):
-        if progress_callback:
-            progress_callback(idx + 1, len(chunks))
-        
-        result = extract_fields_openai(client, model, part, lob)
-        if result.get('evaluation_date') and not merged['evaluation_date']:
-            merged['evaluation_date'] = result.get('evaluation_date', '')
-        if result.get('carrier') and not merged['carrier']:
-            merged['carrier'] = result.get('carrier', '')
-        if isinstance(result.get('claims'), list):
-            merged['claims'].extend(result['claims'])
-        time.sleep(0.3)
-    return merged
-
-
-def _extract_carrier_from_text(text: str) -> str:
-    """Extract carrier name from text using regex patterns"""
-    import re
-    patterns = [
-        r"\b(?:Carrier|company|insurer|provider)\s*[:\-]\s*([A-Za-z0-9 &'.\-/]+)",
-        r"\b([A-Z][A-Za-z0-9 &'.\-/]+(?=Insurance|Ins|Corp|Corporation|Company|Co|LLC|Inc))\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            candidate = m.group(1).strip()
-            if len(candidate) > 2:
-                return candidate
-    return ""
-
-
-def _extract_carrier_from_filename(filename: str) -> str:
-    """Extract carrier name from filename"""
-    import re
-    stem = Path(filename).stem.replace('_', ' ').replace('-', ' ').replace('.', ' ')
-    m = re.search(r"\b([A-Z][A-Za-z0-9 &'.\-/]+(?=Insurance|Ins|Corp|Corporation|Company|Co|LLC|Inc))\b", stem, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-
-# ============================================================================
-# Data Processing
-# ============================================================================
-
-def process_pdf_content(text: str, filename: str, client, model: str, progress_placeholder) -> List[Dict]:
-    """Process extracted PDF text and return results"""
-    results: List[Dict] = []
-    
-    progress_placeholder.text("🔍 Detecting Lines of Business...")
-    lobs = classify_lobs_multi_openai(client, model, text)
-    progress_placeholder.text(f"📋 Detected LoBs: {', '.join(lobs)}")
-    
-    for i, lob in enumerate(lobs):
-        progress_placeholder.text(f"📊 Extracting {lob} claims ({i+1}/{len(lobs)})...")
-        
-        def update_progress(current, total):
-            progress_placeholder.text(f"📊 Extracting {lob} claims - chunk {current}/{total}...")
-        
-        fields = extract_fields_openai_chunked(client, model, text, lob, update_progress)
-        carrier = fields.get('carrier') or _extract_carrier_from_text(text) or _extract_carrier_from_filename(filename)
-        
-        results.append({
-            'lob': lob,
-            'carrier': carrier,
-            'fields': fields,
-            'source_file': filename
-        })
-    
-    return results
-
-
-def results_to_dataframes(all_results: List[Dict]) -> Dict[str, pd.DataFrame]:
-    """Convert processing results to DataFrames organized by LoB"""
-    auto_rows: List[Dict] = []
-    property_rows: List[Dict] = []
-    gl_rows: List[Dict] = []
-    wc_rows: List[Dict] = []
-    
-    for result in all_results:
-        lob = result['lob']
-        carrier = result['carrier']
-        fields = result['fields']
-        source_file = result['source_file']
-        
-        if lob == 'AUTO':
-            for c in fields.get('claims', []):
-                auto_rows.append({
-                    'evaluation_date': fields.get('evaluation_date', ''),
-                    'carrier': c.get('carrier', '') or carrier or fields.get('carrier', ''),
-                    'claim_number': c.get('claim_number', ''),
-                    'loss_date': c.get('loss_date', ''),
-                    'paid_loss': c.get('paid_loss', ''),
-                    'reserve': c.get('reserve', ''),
-                    'alae': c.get('alae', ''),
-                    'source_file': source_file
-                })
-        elif lob == 'PROPERTY':
-            for c in fields.get('claims', []):
-                property_rows.append({
-                    'evaluation_date': fields.get('evaluation_date', ''),
-                    'carrier': c.get('carrier', '') or carrier or fields.get('carrier', ''),
-                    'claim_number': c.get('claim_number', ''),
-                    'loss_date': c.get('loss_date', ''),
-                    'paid_loss': c.get('paid_loss', ''),
-                    'reserve': c.get('reserve', ''),
-                    'alae': c.get('alae', ''),
-                    'source_file': source_file
-                })
-        elif lob in ('GENERAL LIABILITY', 'GL'):
-            for c in fields.get('claims', []):
-                gl_rows.append({
-                    'evaluation_date': fields.get('evaluation_date', ''),
-                    'carrier': c.get('carrier', '') or carrier or fields.get('carrier', ''),
-                    'claim_number': c.get('claim_number', ''),
-                    'loss_date': c.get('loss_date', ''),
-                    'bi_paid_loss': c.get('bi_paid_loss', ''),
-                    'pd_paid_loss': c.get('pd_paid_loss', ''),
-                    'bi_reserve': c.get('bi_reserve', ''),
-                    'pd_reserve': c.get('pd_reserve', ''),
-                    'alae': c.get('alae', ''),
-                    'source_file': source_file
-                })
-        elif lob == 'WC':
-            for c in fields.get('claims', []):
-                wc_rows.append({
-                    'evaluation_date': fields.get('evaluation_date', ''),
-                    'carrier': c.get('carrier', '') or carrier or fields.get('carrier', ''),
-                    'claim_number': c.get('claim_number', ''),
-                    'loss_date': c.get('loss_date', ''),
-                    'Indemnity_paid_loss': c.get('Indemnity_paid_loss', ''),
-                    'Medical_paid_loss': c.get('Medical_paid_loss', ''),
-                    'Indemnity_reserve': c.get('Indemnity_reserve', ''),
-                    'Medical_reserve': c.get('Medical_reserve', ''),
-                    'ALAE': c.get('ALAE', ''),
-                    'source_file': source_file
-                })
-    
-    per_lob = {}
-    if auto_rows:
-        per_lob['AUTO'] = pd.DataFrame(auto_rows, columns=['evaluation_date', 'carrier', 'claim_number', 'loss_date', 'paid_loss', 'reserve', 'alae', 'source_file'])
-    if property_rows:
-        per_lob['PROPERTY'] = pd.DataFrame(property_rows, columns=['evaluation_date', 'carrier', 'claim_number', 'loss_date', 'paid_loss', 'reserve', 'alae', 'source_file'])
-    if gl_rows:
-        per_lob['GL'] = pd.DataFrame(gl_rows, columns=['evaluation_date', 'carrier', 'claim_number', 'loss_date', 'bi_paid_loss', 'pd_paid_loss', 'bi_reserve', 'pd_reserve', 'alae', 'source_file'])
-    if wc_rows:
-        per_lob['WC'] = pd.DataFrame(wc_rows, columns=['evaluation_date', 'carrier', 'claim_number', 'loss_date', 'Indemnity_paid_loss', 'Medical_paid_loss', 'Indemnity_reserve', 'Medical_reserve', 'ALAE', 'source_file'])
-    
-    return per_lob
-
-
-def create_excel_download(per_lob: Dict[str, pd.DataFrame]) -> bytes:
-    """Create Excel file with all LoB sheets"""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for lob, df in per_lob.items():
-            if not df.empty:
-                sheet_name = f"{lob.lower()}_claims"
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-    output.seek(0)
-    return output.getvalue()
-
-
-# ============================================================================
-# Streamlit App
-# ============================================================================
-
-# EXL Custom CSS
-EXL_CUSTOM_CSS = """
+st.markdown("""
 <style>
-    /* Force light theme */
+    /* Modern Clean Theme with OKLCH colors */
     :root {
-        --background-color: #d6d3d1 !important;
-        --secondary-background-color: #F1F5F9 !important;
-        --text-color: #1E293B !important;
+        --radius: 0.65rem;
+        --background: oklch(1 0 0);
+        --foreground: oklch(0.141 0.005 285.823);
+        --card: oklch(1 0 0);
+        --card-foreground: oklch(0.141 0.005 285.823);
+        --primary: oklch(0.646 0.222 41.116);
+        --primary-foreground: oklch(0.98 0.016 73.684);
+        --secondary: oklch(0.967 0.001 286.375);
+        --secondary-foreground: oklch(0.21 0.006 285.885);
+        --muted: oklch(0.967 0.001 286.375);
+        --muted-foreground: oklch(0.552 0.016 285.938);
+        --accent: oklch(0.967 0.001 286.375);
+        --accent-foreground: oklch(0.21 0.006 285.885);
+        --border: oklch(0.92 0.004 286.32);
+        --input: oklch(0.92 0.004 286.32);
+        --ring: oklch(0.75 0.183 55.934);
+        --sidebar: oklch(0.985 0 0);
+        --sidebar-foreground: oklch(0.141 0.005 285.823);
+        --sidebar-primary: oklch(0.646 0.222 41.116);
+        --sidebar-border: oklch(0.92 0.004 286.32);
     }
     
-    /* Main app background */
-    .stApp {
-        background-color: #d6d3d1 !important;
+    .stApp { 
+        background-color: #d1d5db;
     }
     
-    /* Sidebar styling - force light */
+    /* Hide Streamlit branding but keep sidebar toggle */
+    #MainMenu, footer { visibility: hidden; }
+    .stDeployButton { display: none; }
+    
+    /* Keep sidebar toggle button visible */
+    [data-testid="collapsedControl"] {
+        visibility: visible !important;
+        display: flex !important;
+    }
+    
+    /* Sidebar styling - Clean light */
     [data-testid="stSidebar"] {
-        background-color: #F1F5F9 !important;
+        background-color: #e5e7eb;
+        border-right: 1px solid #E5E5E5;
     }
     
     [data-testid="stSidebar"] * {
-        color: #1E293B !important;
+        color: #1A1A2E !important;
     }
     
-    [data-testid="stSidebar"] .stSelectbox label,
-    [data-testid="stSidebar"] .stTextInput label,
-    [data-testid="stSidebar"] .stCheckbox label {
-        color: #1E293B !important;
+    [data-testid="stSidebar"] .stMarkdown p {
+        color: #666666 !important;
     }
     
-    /* Hide Streamlit branding and menu */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .stDeployButton {display: none;}
-    [data-testid="stToolbar"] {display: none;}
-    [data-testid="stDecoration"] {display: none;}
-    
-    /* Hide top-right hamburger menu */
-    button[kind="header"] {display: none;}
-    
-    /* Custom header bar */
-    .main-header {
-        background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
-        padding: 1rem 2rem;
-        border-radius: 0 0 10px 10px;
-        margin: -1rem -1rem 1rem -1rem;
-        color: white;
+    /* Button styling - Primary orange */
+    .stButton > button {
+        border-radius: var(--radius);
+        font-weight: 500;
+        transition: all 0.2s ease;
+        border: 1px solid #E5E5E5;
     }
     
-    .main-header h1 {
-        color: white !important;
-        margin: 0;
-        font-size: 1.8rem;
-    }
-    
-    .main-header .subtitle {
-        color: rgba(255,255,255,0.8);
-        font-size: 0.9rem;
-        margin-top: 0.3rem;
-    }
-    
-    /* EXL Logo styling */
-    .exl-logo {
-        font-weight: bold;
-        font-size: 1.5rem;
-        color: #1E3A8A;
-    }
-    
-    /* Primary button styling */
     .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
+        background-color: #E85D04;
         border: none;
-        border-radius: 8px;
-        padding: 0.5rem 1.5rem;
-        font-weight: 600;
-        transition: all 0.3s ease;
         color: white !important;
     }
     
     .stButton > button[kind="primary"]:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(30, 58, 138, 0.4);
+        background-color: #C54D00;
     }
     
-    /* All buttons light theme */
-    .stButton > button {
-        border-radius: 8px;
-        transition: all 0.2s ease;
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
-        border: 1px solid #E2E8F0 !important;
+    .stButton > button[kind="secondary"] {
+        background-color: white;
+        border: 1px solid #E5E5E5;
+        color: #1A1A2E !important;
     }
     
-    /* Cards/Expanders styling */
+    .stButton > button[kind="secondary"]:hover {
+        background-color: #F5F5F5;
+    }
+    
+    /* Card/Expander styling */
     .stExpander {
-        background-color: #FFFFFF !important;
-        border: 1px solid #E2E8F0;
-        border-radius: 10px;
-        margin-bottom: 0.5rem;
+        background-color: white;
+        border: 1px solid #E5E5E5;
+        border-radius: var(--radius);
     }
     
-    /* Text inputs */
-    .stTextInput > div > div > input {
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
+    .stExpander:hover {
+        border-color: #CCCCCC;
     }
     
-    /* Select boxes */
-    .stSelectbox > div > div {
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
+    /* Metrics */
+    [data-testid="stMetricValue"] { 
+        color: #E85D04 !important; 
+        font-weight: 600; 
     }
     
-    /* Date inputs */
-    .stDateInput > div > div > input {
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        background-color: #F5F5F5;
+        padding: 4px;
+        border-radius: var(--radius);
+        width: 100%;
+    }
+    
+    /* Make tabs fill full width */
+    .stTabs [data-baseweb="tab-list"] button {
+        flex: 1;
+        width: 100%;
+    }
+    
+    .stTabs [aria-selected="true"] { 
+        background-color: white !important; 
+        color: #1A1A2E !important;
+        border-radius: calc(var(--radius) - 2px);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    
+    .stTabs [aria-selected="false"] {
+        background-color: transparent;
+        color: #666666;
     }
     
     /* File uploader */
     [data-testid="stFileUploader"] {
-        background-color: #FFFFFF !important;
+        border: 1px dashed #CCCCCC;
+        border-radius: var(--radius);
+        padding: 1rem;
+        background-color: #FAFAFA;
     }
     
-    /* Metrics styling */
-    [data-testid="stMetricValue"] {
-        color: #1E3A8A !important;
-        font-weight: 700;
+    [data-testid="stFileUploader"]:hover {
+        border-color: #E85D04;
+        background-color: #FFF8F0;
     }
     
-    /* Tab styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-        background-color: #FFFFFF !important;
-        padding: 0.5rem;
-        border-radius: 10px;
+    /* Progress bar */
+    .stProgress > div > div > div {
+        background-color: #E85D04;
     }
     
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        background-color: #F1F5F9 !important;
-        color: #1E293B !important;
+    /* Input fields */
+    .stTextInput > div > div > input,
+    .stSelectbox > div > div > div {
+        border-color: #E5E5E5;
+        border-radius: var(--radius);
     }
     
-    .stTabs [aria-selected="true"] {
-        background-color: #1E3A8A !important;
-        color: white !important;
-    }
-    
-    /* Success/Error messages */
-    .stSuccess {
-        background-color: #ECFDF5 !important;
-        border-left: 4px solid #10B981;
-        border-radius: 0 8px 8px 0;
-    }
-    
-    .stError {
-        background-color: #FEF2F2 !important;
-        border-left: 4px solid #EF4444;
-        border-radius: 0 8px 8px 0;
-    }
-    
-    /* Info messages */
-    .stInfo {
-        background-color: #EFF6FF !important;
-        border-left: 4px solid #3B82F6;
-        border-radius: 0 8px 8px 0;
-    }
-    
-    /* Warning messages */
-    .stWarning {
-        background-color: #FFFBEB !important;
-        border-left: 4px solid #F59E0B;
+    .stTextInput > div > div > input:focus,
+    .stSelectbox > div > div > div:focus {
+        border-color: #E85D04;
+        box-shadow: 0 0 0 1px #E85D04;
     }
     
     /* Dataframe styling */
     .stDataFrame {
-        border-radius: 10px;
+        border-radius: var(--radius);
+        overflow: hidden;
+        border: 1px solid #E5E5E5;
+    }
+    
+    /* Links */
+    a { color: #E85D04 !important; }
+    a:hover { color: #C54D00 !important; }
+    
+    /* Divider */
+    hr {
+        border-color: #E5E5E5;
+    }
+    
+    /* Full height tabs - flex layout */
+    .main .block-container {
+        display: flex;
+        flex-direction: column;
+        height: calc(100vh - 80px);
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+        max-width: 100%;
+    }
+    
+    /* Target Streamlit tabs container */
+    [data-testid="stTabs"] {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        height: 100%;
+    }
+    
+    /* Tab list header */
+    [data-testid="stTabs"] > div:first-child {
+        flex-shrink: 0;
+    }
+    
+    /* Tab panels container */
+    [data-testid="stTabs"] > div:nth-child(2) {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow-y: auto;
+    }
+    
+    /* Individual tab panel */
+    [data-testid="stTabs"] [data-baseweb="tab-panel"] {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 1rem 0;
+    }
+    
+    /* Vertical block inside tab panel */
+    [data-testid="stTabs"] [data-baseweb="tab-panel"] > div {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+    }
+    
+    /* Main section height */
+    section[data-testid="stSidebar"] + section .main {
+        height: 100vh;
         overflow: hidden;
     }
     
-    /* Sidebar styling */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #F8FAFC 0%, #F1F5F9 100%);
-    }
-    
-    [data-testid="stSidebar"] .stMarkdown h1,
-    [data-testid="stSidebar"] .stMarkdown h2,
-    [data-testid="stSidebar"] .stMarkdown h3 {
-        color: #1E3A8A;
-    }
-    
-    /* Loading spinner */
-    .stSpinner > div {
-        border-top-color: #1E3A8A !important;
-    }
-    
-    /* Progress bar */
-    .stProgress > div > div {
-        background-color: #1E3A8A;
-    }
-    
-    /* Custom divider */
-    hr {
-        border: none;
-        height: 1px;
-        background: linear-gradient(90deg, transparent, #CBD5E1, transparent);
-        margin: 1.5rem 0;
+    /* Ensure stVerticalBlock fills space */
+    [data-testid="stVerticalBlock"] {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
     }
 </style>
-"""
+""", unsafe_allow_html=True)
 
-def main():
-    st.set_page_config(
-        page_title="EXL Claims Document Manager",
-        page_icon="📄",
-        layout="wide",
-        initial_sidebar_state="expanded",
-        menu_items=None  # Hide the menu
-    )
-    
-    # Inject custom CSS
-    st.markdown(EXL_CUSTOM_CSS, unsafe_allow_html=True)
-    
-    # Custom header with EXL branding
-    st.markdown("""
-        <div class="main-header">
-            <h1>📄 EXL Claims Document Manager</h1>
-            <div class="subtitle">AI-Powered Insurance Document Processing</div>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    # Tabs for different functionalities
-    tab1, tab2 = st.tabs(["📤 PDF Parser", "🤖 AI Agent"])
-    
-    # ========================================================================
-    # TAB 1: PDF Parser (Existing Functionality)
-    # ========================================================================
-    with tab1:
-        st.markdown("Upload insurance claims PDFs to extract structured data and download as Excel.")
-        
-        # Sidebar for configuration
-        st.sidebar.header("⚙️ Configuration")
-        
-        # Try to load config from file
-        cfg = load_config()
-        
-        if cfg:
-            st.sidebar.success("✅ Config loaded from config.py")
-            use_config_file = st.sidebar.checkbox("Use config.py settings", value=True)
-        else:
-            use_config_file = False
-            st.sidebar.info("No config.py found. Enter API keys below.")
-        
-        if not use_config_file:
-            st.sidebar.subheader("API Settings")
-            use_azure = st.sidebar.checkbox("Use Azure OpenAI", value=False)
-            
-            if use_azure:
-                azure_endpoint = st.sidebar.text_input("Azure Endpoint", type="password")
-                azure_api_key = st.sidebar.text_input("Azure API Key", type="password")
-                azure_deployment = st.sidebar.text_input("Azure Deployment Name")
-                cfg = {
-                    'use_azure': True,
-                    'azure_endpoint': azure_endpoint,
-                    'azure_api_key': azure_api_key,
-                    'azure_deployment': azure_deployment,
-                }
-            else:
-                openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-                openai_model = st.sidebar.selectbox(
-                    "Model",
-                    ["gpt-4o-2024-08-06", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-                    index=0
-                )
-                cfg = {
-                    'use_azure': False,
-                    'openai_api_key': openai_api_key,
-                    'openai_model': openai_model,
-                }
-        
-        # File uploader
-        st.header("📤 Upload PDF Files")
-        uploaded_files = st.file_uploader(
-            "Choose PDF files",
-            type=['pdf'],
-            accept_multiple_files=True,
-            help="Upload one or more insurance claims PDF files"
-        )
-        
-        if uploaded_files:
-            st.info(f"📁 {len(uploaded_files)} file(s) uploaded")
-            
-            # Display uploaded files
-            with st.expander("View uploaded files"):
-                for f in uploaded_files:
-                    st.write(f"- {f.name} ({f.size / 1024:.1f} KB)")
-        
-        # Process button
-        if st.button("🚀 Process PDFs", type="primary", disabled=not uploaded_files):
-            # Validate configuration
-            if cfg.get('use_azure'):
-                if not all([cfg.get('azure_endpoint'), cfg.get('azure_api_key'), cfg.get('azure_deployment')]):
-                    st.error("Please provide all Azure OpenAI settings")
-                    return
-            else:
-                if not cfg.get('openai_api_key'):
-                    st.error("Please provide OpenAI API key")
-                    return
-            
-            # Setup client
-            client = setup_openai_client(cfg)
-            if not client:
-                st.error("Failed to setup OpenAI client. Check your API settings.")
-                return
-            
-            model = cfg.get('azure_deployment') if cfg.get('use_azure') else cfg.get('openai_model', 'gpt-4o-2024-08-06')
-            
-            all_results = []
-            
-            # Process each file
-            progress_bar = st.progress(0)
-            status_container = st.container()
-            
-            for i, pdf_file in enumerate(uploaded_files):
-                with status_container:
-                    st.subheader(f"Processing: {pdf_file.name}")
-                    progress_placeholder = st.empty()
-                    
-                    # Extract text from PDF
-                    progress_placeholder.text("📖 Extracting text from PDF...")
-                    text_content = extract_text_from_pdf(pdf_file)
-                    
-                    if not text_content:
-                        st.warning(f"⚠️ Could not extract text from {pdf_file.name}")
-                        continue
-                    
-                    progress_placeholder.text(f"📖 Extracted {len(text_content)} characters")
-                    
-                    # Process the content
-                    results = process_pdf_content(
-                        text_content,
-                        pdf_file.name,
-                        client,
-                        model,
-                        progress_placeholder
-                    )
-                    
-                    all_results.extend(results)
-                    progress_placeholder.text(f"✅ Completed processing {pdf_file.name}")
-                
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            # Convert to DataFrames
-            if all_results:
-                st.success("✅ Processing complete!")
-                
-                per_lob = results_to_dataframes(all_results)
-                
-                # Store in session state for display
-                st.session_state['per_lob'] = per_lob
-                st.session_state['processed'] = True
-            else:
-                st.warning("No claims data found in the uploaded files.")
-        
-        # Display results
-        if st.session_state.get('processed') and st.session_state.get('per_lob'):
-            per_lob = st.session_state['per_lob']
-            
-            st.header("📊 Results")
-            
-            # Summary
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                auto_count = len(per_lob.get('AUTO', []))
-                st.metric("AUTO Claims", auto_count)
-            with col2:
-                property_count = len(per_lob.get('PROPERTY', []))
-                st.metric("PROPERTY Claims", property_count)
-            with col3:
-                gl_count = len(per_lob.get('GL', []))
-                st.metric("GL Claims", gl_count)
-            with col4:
-                wc_count = len(per_lob.get('WC', []))
-                st.metric("WC Claims", wc_count)
-            
-            # Display data in tabs
-            tabs = st.tabs(["AUTO", "PROPERTY", "GL", "WC"])
-            
-            with tabs[0]:
-                if 'AUTO' in per_lob and not per_lob['AUTO'].empty:
-                    st.dataframe(per_lob['AUTO'], use_container_width=True)
-                else:
-                    st.info("No AUTO claims found")
-            
-            with tabs[1]:
-                if 'PROPERTY' in per_lob and not per_lob['PROPERTY'].empty:
-                    st.dataframe(per_lob['PROPERTY'], use_container_width=True)
-                else:
-                    st.info("No PROPERTY claims found")
-            
-            with tabs[2]:
-                if 'GL' in per_lob and not per_lob['GL'].empty:
-                    st.dataframe(per_lob['GL'], use_container_width=True)
-                else:
-                    st.info("No GL claims found")
-            
-            with tabs[3]:
-                if 'WC' in per_lob and not per_lob['WC'].empty:
-                    st.dataframe(per_lob['WC'], use_container_width=True)
-                else:
-                    st.info("No WC claims found")
-            
-            # Download button
-            st.header("📥 Download Results")
-            
-            if any(lob in per_lob and not per_lob[lob].empty for lob in ['AUTO', 'PROPERTY', 'GL', 'WC']):
-                excel_data = create_excel_download(per_lob)
-                
-                st.download_button(
-                    label="⬇️ Download Excel File",
-                    data=excel_data,
-                    file_name="claims_extracted.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-            else:
-                st.info("No data available to download")
+# =============================================================================
+# Session State
+# =============================================================================
 
-    # ========================================================================
-    # TAB 2: AI Agent (New Functionality)
-    # ========================================================================
-    with tab2:
-        st.header("🤖 AI Claims Document Agent")
-        st.markdown("Search for loss run reports using natural language, preview documents, send emails, and parse PDFs.")
-        
-        # Import the agent module dynamically
+def init_session_state():
+    """Initialize session state variables."""
+    defaults = {
+        'per_lob': {},
+        'processed': False,
+        'extraction_success': False,
+        'extracted_info': {},
+        'agent_files': [],
+        'selected_agent_files': [],
+        'parse_results': [],
+        'mock_data_created': False
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
+
+# Initialize mock data once
+if not st.session_state['mock_data_created']:
+    if hasattr(storage, 'create_mock_data'):
+        storage.create_mock_data()
+    st.session_state['mock_data_created'] = True
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def parse_date_str(date_str: str) -> Optional[date]:
+    """Parse date string to date object."""
+    if not date_str:
+        return None
+    for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"]:
         try:
-            import email_agent
-            try:
-                import cloud_storage as doc_storage
-            except ImportError:
-                import mock_storage as doc_storage
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def results_to_dataframes(all_results: List[Dict]) -> Dict[str, pd.DataFrame]:
+    """Convert processing results to DataFrames by LoB."""
+    data = {'AUTO': [], 'PROPERTY': [], 'GL': [], 'WC': []}
+    
+    for result in all_results:
+        lob = result['lob']
+        if lob == "GENERAL LIABILITY":
+            lob = "GL"
+        
+        carrier = result.get('carrier', '')
+        fields = result.get('fields', {})
+        source_file = result.get('source_file', '')
+        
+        for claim in fields.get('claims', []):
+            row = {
+                'evaluation_date': fields.get('evaluation_date', ''),
+                'carrier': claim.get('carrier', '') or carrier,
+                'claim_number': claim.get('claim_number', ''),
+                'loss_date': claim.get('loss_date', ''),
+                'source_file': source_file
+            }
             
-            # Initialize mock data if needed
-            if 'mock_data_created' not in st.session_state:
-                if hasattr(doc_storage, 'create_mock_data'):
-                    doc_storage.create_mock_data()
-                st.session_state['mock_data_created'] = True
-                
-        except ImportError as e:
-            st.error(f"Agent dependencies missing: {e}")
-            st.stop()
+            # Add LOB-specific fields
+            if lob == 'AUTO' or lob == 'PROPERTY':
+                row.update({
+                    'paid_loss': claim.get('paid_loss', ''),
+                    'reserve': claim.get('reserve', ''),
+                    'alae': claim.get('alae', '')
+                })
+            elif lob == 'GL':
+                row.update({
+                    'bi_paid_loss': claim.get('bi_paid_loss', ''),
+                    'pd_paid_loss': claim.get('pd_paid_loss', ''),
+                    'bi_reserve': claim.get('bi_reserve', ''),
+                    'pd_reserve': claim.get('pd_reserve', ''),
+                    'alae': claim.get('alae', '')
+                })
+            elif lob == 'WC':
+                row.update({
+                    'Indemnity_paid_loss': claim.get('Indemnity_paid_loss', ''),
+                    'Medical_paid_loss': claim.get('Medical_paid_loss', ''),
+                    'Indemnity_reserve': claim.get('Indemnity_reserve', ''),
+                    'Medical_reserve': claim.get('Medical_reserve', ''),
+                    'ALAE': claim.get('ALAE', '')
+                })
+            
+            if lob in data:
+                data[lob].append(row)
+    
+    return {lob: pd.DataFrame(rows) for lob, rows in data.items() if rows}
 
-        # ====================================================================
-        # Section 1: Natural Language Search Input
-        # ====================================================================
-        st.subheader("🔍 Search Documents")
-        
-        user_query = st.text_input(
-            "Enter your search query:", 
-            placeholder="e.g., chubbs auto policy 12345 date 2024-2025",
-            help="Type naturally - AI will extract Account, LOB, Policy, and Date Range"
-        )
-        
-        col_extract, col_clear = st.columns([1, 5])
-        
-        with col_extract:
-            extract_clicked = st.button("🤖 Extract", type="primary")
-        
-        with col_clear:
-            if st.button("🗑️ Clear All"):
-                for key in ['extracted_info', 'agent_files', 'selected_agent_files', 'parse_results']:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
-        
-        # Extract information from query
-        if extract_clicked and user_query:
-            with st.spinner("Extracting information..."):
-                try:
-                    from langchain_google_genai import ChatGoogleGenerativeAI
-                    from langchain_core.prompts import ChatPromptTemplate
-                    from langchain_core.output_parsers import JsonOutputParser
-                    from pydantic import BaseModel, Field
-                    import os
-                    
-                    if not os.getenv("GOOGLE_API_KEY"):
-                        st.error("❌ GOOGLE_API_KEY not found")
-                    else:
-                        class ExtractedInfo(BaseModel):
-                            account_name: str = Field(default="", description="Account name")
-                            lob: str = Field(default="", description="Line of Business")
-                            policy_number: str = Field(default="", description="Policy number")
-                            start_date: str = Field(default="", description="Start date DD-MM-YYYY")
-                            end_date: str = Field(default="", description="End date DD-MM-YYYY")
-                        
-                        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-                        parser = JsonOutputParser(pydantic_object=ExtractedInfo)
-                        
-                        accounts = ", ".join(email_agent.VALID_ACCOUNTS)
-                        lobs = ", ".join(email_agent.VALID_LOBS)
-                        
-                        prompt = ChatPromptTemplate.from_messages([
-                            ("system", f"""Extract search criteria from user query.
-Valid Accounts: {accounts}
-Valid LOBs: {lobs}
 
-Rules:
-- Map account variations: "chubbs/chubb" → "Chubbs", "amex" → "Amex", etc.
-- Map LOB variations: "auto/vehicle/car" → "AUTO", "work/wc/workers" → "WC", etc.
-- Date ranges: "2024-2025" → start: "01-01-2024", end: "31-12-2025"
-- "less than 2024" → end: "31-12-2024"
-- Return empty string for missing fields
+def create_excel_download(per_lob: Dict[str, pd.DataFrame]) -> bytes:
+    """Create Excel file with all LoB sheets."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        for lob, df in per_lob.items():
+            if not df.empty:
+                df.to_excel(writer, sheet_name=f"{lob.lower()}_claims", index=False)
+    output.seek(0)
+    return output.getvalue()
 
-{{format_instructions}}"""),
-                            ("user", "{query}")
-                        ])
-                        
-                        chain = prompt | llm | parser
-                        extracted = chain.invoke({"query": user_query, "format_instructions": parser.get_format_instructions()})
-                        st.session_state['extracted_info'] = extracted
-                        st.success("✅ Extracted!")
-                        
-                except Exception as e:
-                    st.error(f"Extraction error: {e}")
+# =============================================================================
+# Sidebar - Clean Design
+# =============================================================================
+
+def render_sidebar():
+    """Render the clean sidebar component."""
+    
+    with st.sidebar:
+        # Logo section - using image
+        logo_path = os.path.join(os.path.dirname(__file__), "assets", "exl_logo.png")
+        if os.path.exists(logo_path):
+            st.image(logo_path, use_container_width=True)
+        else:
+            # Fallback to text logo
+            st.markdown("""
+            <div style="text-align: center; padding: 1rem 0 1.5rem 0;">
+                <span style="color: #E85D04; font-size: 2rem; font-weight: 700;">EXL</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # App title
+        st.markdown("""
+        <div style="text-align: center; margin-bottom: 1.5rem;">
+            <p style="color: #1A1A2E; margin: 0; font-size: 1rem; font-weight: 600;">
+                Claims Document Manager
+            </p>
+            <p style="color: #888888; font-size: 0.8rem; margin-top: 0.25rem;">
+                AI-Powered Document Processing
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
         
         st.markdown("---")
         
-        # ====================================================================
-        # Section 2: Editable Filters (Pre-populated from AI)
-        # ====================================================================
-        st.subheader("📋 Search Filters (Editable)")
+        # About section
+        st.markdown("**About**")
+        st.markdown("""
+        <p style="font-size: 0.85rem; color: #666;">
+        Platform for insurance claims document processing. 
+        Extract structured data from PDFs using AI technology.
+        </p>
+        """, unsafe_allow_html=True)
         
-        # Get extracted info or defaults
-        extracted = st.session_state.get('extracted_info', {})
+        st.markdown("---")
         
+        
+        # Footer
+        st.markdown("""
+        <div style="text-align: center; padding-top: 0.5rem;">
+            <small style="color: #999;">© 2025 EXL Service</small>
+        </div>
+        """, unsafe_allow_html=True)
+
+# =============================================================================
+# Tab 1: PDF Parser
+# =============================================================================
+
+def render_pdf_parser_tab():
+    """Render the PDF Parser tab."""
+    st.markdown("Upload insurance claims PDFs to extract structured data.")
+    
+    api_key = get_google_api_key()
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "Choose PDF files",
+        type=['pdf'],
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        st.info(f"{len(uploaded_files)} file(s) uploaded")
+    
+    # Process button
+    if st.button("Process PDFs", type="primary", disabled=not uploaded_files or not api_key):
+        if not api_key:
+            st.error("GOOGLE_API_KEY not set in .env")
+            return
+        
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(get_model_name())
+        except Exception as e:
+            st.error(f"Failed to setup Gemini: {e}")
+            return
+        
+        all_results = []
+        progress = st.progress(0)
+        status = st.empty()
+        
+        for i, pdf_file in enumerate(uploaded_files):
+            status.info(f"Processing: {pdf_file.name}")
+            
+            text = extract_text_from_pdf(pdf_file)
+            if not text:
+                st.warning(f"No text in {pdf_file.name}")
+                continue
+            
+            status.info(f"Detecting LOBs in {pdf_file.name}")
+            lobs = classify_lobs(model, text)
+            
+            for lob in lobs:
+                status.info(f"Extracting {lob} claims from {pdf_file.name}")
+                fields = extract_fields_chunked(model, text, lob)
+                
+                all_results.append({
+                    'lob': lob,
+                    'carrier': fields.get('carrier', ''),
+                    'fields': fields,
+                    'source_file': pdf_file.name
+                })
+            
+            progress.progress((i + 1) / len(uploaded_files))
+        
+        if all_results:
+            st.session_state['per_lob'] = results_to_dataframes(all_results)
+            st.session_state['processed'] = True
+            status.success("Processing complete!")
+        else:
+            status.warning("No claims data found")
+    
+    # Display results
+    if st.session_state.get('processed') and st.session_state.get('per_lob'):
+        per_lob = st.session_state['per_lob']
+        
+        st.markdown("---")
+        st.header("Results")
+        
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("AUTO", len(per_lob.get('AUTO', [])))
+        with col2:
+            st.metric("PROPERTY", len(per_lob.get('PROPERTY', [])))
+        with col3:
+            st.metric("GL", len(per_lob.get('GL', [])))
+        with col4:
+            st.metric("WC", len(per_lob.get('WC', [])))
+        
+        # Data tabs
+        tabs = st.tabs(["AUTO", "PROPERTY", "GL", "WC"])
+        
+        for i, lob in enumerate(["AUTO", "PROPERTY", "GL", "WC"]):
+            with tabs[i]:
+                if lob in per_lob and not per_lob[lob].empty:
+                    st.dataframe(per_lob[lob], use_container_width=True)
+                else:
+                    st.info(f"No {lob} claims found")
+        
+        # Download button
+        if any(lob in per_lob and not per_lob[lob].empty for lob in ['AUTO', 'PROPERTY', 'GL', 'WC']):
+            st.download_button(
+                "Download Excel",
+                data=create_excel_download(per_lob),
+                file_name="claims_extracted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+
+# =============================================================================
+# Tab 2: AI Document Agent
+# =============================================================================
+
+def extract_search_criteria(query: str) -> Dict:
+    """Extract search criteria from natural language query."""
+    if not get_google_api_key():
+        return {}
+    
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import JsonOutputParser
+        from pydantic import BaseModel, Field
+        
+        class ExtractedInfo(BaseModel):
+            account_name: str = Field(default="", description="Account name")
+            insured_name: str = Field(default="", description="Insured name if different from account")
+            lob: str = Field(default="", description="Line of Business")
+            policy_number: str = Field(default="", description="Policy number")
+            start_year: str = Field(default="", description="Start year YYYY")
+            end_year: str = Field(default="", description="End year YYYY")
+        
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        parser = JsonOutputParser(pydantic_object=ExtractedInfo)
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""Extract search criteria from user query.
+Valid Accounts: {', '.join(VALID_ACCOUNTS)}
+Valid LOBs: {', '.join(VALID_LOBS)}
+
+Rules:
+- Map variations: "chubbs/chubb" → "Chubbs", "amex" → "Amex", "weslaco" → "WESLACO_ISD"
+- Map LOBs: "auto/vehicle" → "AUTO", "work/wc" → "WC", "marine/inland" → "InlandMarine"
+- Extract year ranges: "2023-2024" → start_year: "2023", end_year: "2024"
+- Single year: use for both start and end
+- "loss run" or "loss runs" indicates searching for loss run reports
+
+{{format_instructions}}"""),
+            ("user", "{query}")
+        ])
+        
+        chain = prompt | llm | parser
+        return chain.invoke({"query": query, "format_instructions": parser.get_format_instructions()})
+    except Exception:
+        return {}
+
+
+def render_ai_agent_tab():
+    """Render the AI Agent tab."""
+    st.markdown("Search documents using natural language and send via email.")
+    
+    # Only show search and filters if no documents fetched yet
+    show_search_filters = not st.session_state.get('agent_files')
+    
+    if show_search_filters:
+        # Search input
+        st.subheader("Search Documents")
+        user_query = st.text_input(
+            "Enter search query:",
+            placeholder="e.g., chubbs auto policy 2456 loss run 2023-2024"
+        )
+        
+        col1, col2 = st.columns([1, 5])
+        
+        with col1:
+            if st.button("Extract", type="primary"):
+                if user_query:
+                    with st.spinner("Extracting..."):
+                        extracted = extract_search_criteria(user_query)
+                        if extracted:
+                            st.session_state['extracted_info'] = extracted
+                            st.session_state['extraction_success'] = True
+                            st.rerun()
+        
+        with col2:
+            if st.button("Clear"):
+                st.session_state['extracted_info'] = {}
+                st.session_state['agent_files'] = []
+                st.session_state['selected_agent_files'] = []
+                st.session_state['parse_results'] = []
+                st.rerun()
+        
+        if st.session_state.get('extraction_success'):
+            st.toast("Extracted! Filters auto-filled.", icon="✅")
+            st.session_state['extraction_success'] = False
+        
+        st.markdown("---")
+        
+        # Editable filters - Updated for new structure
+        st.subheader("Filters")
+    
+    extracted = st.session_state.get('extracted_info', {})
+    
+    if show_search_filters:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            account_options = ["-- All --"] + email_agent.VALID_ACCOUNTS
-            default_idx = 0
-            if extracted.get('account_name'):
-                try:
-                    default_idx = account_options.index(extracted['account_name'])
-                except ValueError:
-                    pass
-            selected_account = st.selectbox("Account Name", account_options, index=default_idx)
+            options = ["-- All --"] + VALID_ACCOUNTS
+            idx = 0
+            if extracted.get('account_name') in VALID_ACCOUNTS:
+                idx = options.index(extracted['account_name'])
+            selected_account = st.selectbox("Account", options, index=idx)
         
         with col2:
-            lob_options = ["-- All --"] + email_agent.VALID_LOBS
-            default_idx = 0
-            if extracted.get('lob'):
-                lob_val = extracted['lob'].upper()
-                try:
-                    default_idx = lob_options.index(lob_val)
-                except ValueError:
-                    pass
-            selected_lob = st.selectbox("Line of Business", lob_options, index=default_idx)
+            options = ["-- All --"] + VALID_LOBS
+            idx = 0
+            lob_val = extracted.get('lob', '').upper()
+            # Handle InlandMarine case sensitivity
+            if lob_val == "INLANDMARINE":
+                lob_val = "InlandMarine"
+            if lob_val in VALID_LOBS:
+                idx = options.index(lob_val)
+            selected_lob = st.selectbox("LOB", options, index=idx)
         
         with col3:
-            policy_number = st.text_input("Policy Number", value=extracted.get('policy_number', ''))
+            policy_number = st.text_input("Policy", value=extracted.get('policy_number', ''))
         
-        # Date Range
-        col_d1, col_d2 = st.columns(2)
-        
-        def parse_date(date_str):
-            if not date_str:
-                return None
-            for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"]:
-                try:
-                    return datetime.strptime(date_str, fmt).date()
-                except:
-                    pass
-            return None
-        
-        with col_d1:
-            start_default = parse_date(extracted.get('start_date', ''))
-            start_date = st.date_input("Start Date", value=start_default)
-        
-        with col_d2:
-            end_default = parse_date(extracted.get('end_date', ''))
-            end_date = st.date_input("End Date", value=end_default)
+        # Year range filters instead of date range
+        col_y1, col_y2 = st.columns(2)
+        with col_y1:
+            start_year = st.text_input("Start Year", value=extracted.get('start_year', ''), placeholder="e.g., 2023")
+        with col_y2:
+            end_year = st.text_input("End Year", value=extracted.get('end_year', ''), placeholder="e.g., 2024")
         
         st.markdown("---")
         
-        # ====================================================================
-        # Section 3: Fetch Button
-        # ====================================================================
-        if st.button("🔎 Fetch Documents", type="primary"):
-            fetch_placeholder = st.empty()
-            fetch_placeholder.info("🔍 Searching documents...")
-            
-            # Prepare search params
+        # Fetch button
+        if st.button("Fetch Documents", type="primary"):
             acct = selected_account if selected_account != "-- All --" else None
             lob = selected_lob if selected_lob != "-- All --" else None
-            policy = policy_number if policy_number else None
-            date_str = start_date.strftime("%d-%m-%Y") if start_date else None
+            policy = policy_number or None
             
-            # Search
-            results = doc_storage.search_files(acct, lob, policy, date_str)
-            
-            # Filter by date range
-            if start_date and end_date and results:
-                fetch_placeholder.info("📅 Filtering by date range...")
-                filtered = []
-                for f in results:
-                    f_date = parse_date(f.get('effective_date', ''))
-                    if f_date and start_date <= f_date <= end_date:
-                        filtered.append(f)
-                    elif not f_date:
-                        filtered.append(f)
-                results = filtered
-                results = filtered
+            # Use the search with year range
+            results = storage.search_files(
+                account_name=acct,
+                lob=lob,
+                policy_number=policy,
+                start_year=start_year if start_year else None,
+                end_year=end_year if end_year else None
+            )
             
             st.session_state['agent_files'] = results
             st.session_state['selected_agent_files'] = []
             
             if results:
-                fetch_placeholder.success(f"✅ Found {len(results)} document(s)")
+                st.toast(f"Found {len(results)} document(s)", icon="✅")
+                st.rerun()
             else:
-                fetch_placeholder.warning("⚠️ No documents found matching criteria")
+                st.warning("No documents found")
+    
+    # Display found documents
+    if st.session_state.get('agent_files'):
+        # New Search button to go back
+        if st.button("New Search", type="secondary"):
+            st.session_state['agent_files'] = []
+            st.session_state['selected_agent_files'] = []
+            st.session_state['parse_results'] = []
+            st.session_state['extracted_info'] = {}
+            st.rerun()
         
         st.markdown("---")
+        st.subheader("Documents")
         
-        # ====================================================================
-        # Section 4: Document Preview with Selection
-        # ====================================================================
-        if 'agent_files' in st.session_state and st.session_state['agent_files']:
-            st.subheader("📁 Found Documents")
+        files = st.session_state['agent_files']
+        selected = st.session_state.get('selected_agent_files', [])
+        
+        for idx, f in enumerate(files):
+            col_chk, col_info = st.columns([0.5, 9.5])
             
-            files = st.session_state['agent_files']
-            selected = st.session_state.get('selected_agent_files', [])
+            with col_chk:
+                is_sel = st.checkbox("", key=f"sel_{idx}", value=f in selected)
+                if is_sel and f not in selected:
+                    selected.append(f)
+                elif not is_sel and f in selected:
+                    selected.remove(f)
             
-            for idx, f in enumerate(files):
-                col_chk, col_info = st.columns([0.5, 9.5])
-                
-                with col_chk:
-                    is_sel = st.checkbox("", key=f"sel_{idx}", value=f in selected)
-                    if is_sel and f not in selected:
-                        selected.append(f)
-                    elif not is_sel and f in selected:
-                        selected.remove(f)
-                
-                with col_info:
-                    with st.expander(f"📄 {f.get('filename', 'Unknown')} | {f.get('account', '')} | {f.get('lob', '')}", expanded=False):
-                        st.markdown(f"""
+            with col_info:
+                # Updated display to show new structure info
+                date_range = f.get('date_range', f"{f.get('start_year', '')}-{f.get('end_year', '')}")
+                with st.expander(f"{f.get('filename')} | {f.get('account')} | {f.get('lob')} | {date_range}"):
+                    st.markdown(f"""
 | Field | Value |
 |-------|-------|
 | **Account** | {f.get('account', 'N/A')} |
+| **Insured** | {f.get('insured_name', f.get('account', 'N/A'))} |
 | **LOB** | {f.get('lob', 'N/A')} |
 | **Policy** | {f.get('policy_number', 'N/A')} |
-| **Date** | {f.get('effective_date', 'N/A')} |
-| **Source** | {f.get('source', 'N/A')} |
-| **Path** | `{f.get('folder_path', 'N/A')}` |
+| **Date Range** | {date_range} |
+| **Folder** | {f.get('folder_path', 'N/A')} |
 """)
-                        # Preview button
-                        if st.button(f"👁️ Preview PDF", key=f"preview_{idx}"):
-                            file_path = f.get('path', f.get('full_path', ''))
-                            if os.path.exists(file_path):
-                                try:
-                                    text = ""
-                                    with pdfplumber.open(file_path) as pdf:
-                                        for page in pdf.pages[:2]:
-                                            text += (page.extract_text() or "") + "\n"
-                                    st.text_area("PDF Text Preview", text[:3000], height=250)
-                                except Exception as e:
-                                    st.error(f"Preview error: {e}")
-                            else:
-                                st.warning("File not found locally")
+                    if st.button(f"Preview", key=f"prev_{idx}"):
+                        path = f.get('path', f.get('full_path', ''))
+                        if os.path.exists(path):
+                            text = preview_pdf(path)
+                            st.text_area("Preview", text, height=200)
+                        else:
+                            st.warning("File not found locally")
+        
+        st.session_state['selected_agent_files'] = selected
+        
+        # Actions section
+        st.markdown("---")
+        st.subheader("Actions")
+        st.info(f"{len(selected)} document(s) selected")
+        
+        # Email configuration section - show when documents are selected
+        if len(selected) > 0:
+            st.markdown("##### Email Recipients")
             
-            st.session_state['selected_agent_files'] = selected
+            # Collect unique LOBs from selected files and their default emails
+            lob_emails_for_selected = {}
+            for f in selected:
+                lob = f.get('lob', 'UNKNOWN')
+                if lob not in lob_emails_for_selected:
+                    default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
+                    lob_emails_for_selected[lob] = default_email
+            
+            # Create editable email inputs for each LOB
+            edited_emails = {}
+            for lob, default_email in lob_emails_for_selected.items():
+                col_lob, col_email = st.columns([1, 3])
+                with col_lob:
+                    st.markdown(f"**{lob}:**")
+                with col_email:
+                    edited_emails[lob] = st.text_input(
+                        f"Email for {lob}",
+                        value=default_email,
+                        key=f"email_{lob}",
+                        label_visibility="collapsed",
+                        placeholder="Enter email address(es), comma-separated"
+                    )
+            
+            # Additional recipients
+            additional_emails = st.text_input(
+                "Additional Recipients (CC)",
+                value="",
+                placeholder="Enter additional email addresses, comma-separated",
+                key="additional_emails"
+            )
             
             st.markdown("---")
-            
-            # ================================================================
-            # Section 5: Action Buttons
-            # ================================================================
-            st.subheader("⚡ Actions")
-            st.info(f"📌 {len(selected)} document(s) selected")
-            
-            col_email, col_parse, _ = st.columns([1, 1, 4])
-            
-            with col_email:
-                if st.button("📧 Send Email", disabled=len(selected) == 0, type="primary"):
-                    email_placeholder = st.empty()
-                    progress_bar = st.progress(0)
-                    
-                    total = len(selected)
-                    success_count = 0
-                    
-                    for idx, f in enumerate(selected):
-                        email_placeholder.info(f"📤 Sending email for {f.get('filename')}...")
-                        
-                        lob = f.get('lob', 'UNKNOWN')
-                        policy = f.get('policy_number', 'Unknown')
-                        success, msg = email_agent.send_email_action(f, lob, policy)
-                        
-                        progress_bar.progress((idx + 1) / total)
-                        
-                        if success:
-                            success_count += 1
-                    
-                    progress_bar.empty()
-                    
-                    if success_count == total:
-                        email_placeholder.success(f"✅ Successfully sent {success_count}/{total} email(s)!")
-                    elif success_count > 0:
-                        email_placeholder.warning(f"⚠️ Sent {success_count}/{total} email(s). Some failed.")
+        
+        col_email, col_parse, _ = st.columns([1, 1, 4])
+        
+        with col_email:
+            if st.button("Send Email", disabled=len(selected) == 0, type="primary"):
+                for f in selected:
+                    lob = f.get('lob', 'UNKNOWN')
+                    # Use the edited email if available
+                    recipient = edited_emails.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
+                    success, msg = send_email_action(f, lob, f.get('policy_number', ''), recipient_override=recipient)
+                    if success:
+                        st.toast(f"{f.get('filename')}: {msg}", icon="✅")
                     else:
-                        email_placeholder.error(f"❌ Failed to send emails. Check SMTP credentials.")
-            
-            with col_parse:
-                if st.button("🔬 Parse PDF", disabled=len(selected) == 0, type="primary"):
-                    parse_results = []
-                    parse_placeholder = st.empty()
-                    parse_progress = st.progress(0)
-                    total_files = len(selected)
+                        st.error(f"{f.get('filename')}: {msg}")
+        
+        with col_parse:
+            api_key = get_google_api_key()
+            if st.button("Parse PDF", disabled=len(selected) == 0 or not api_key, type="primary"):
+                try:
+                    import google.generativeai as genai
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel(get_model_name())
+                except Exception as e:
+                    st.error(f"Failed to setup Gemini: {e}")
+                    return
+                
+                parse_results = []
+                all_parsed_results = []  # For Excel generation
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for idx, f in enumerate(selected):
+                    path = f.get('path', f.get('full_path', ''))
+                    status_text.info(f"Parsing: {f.get('filename')}")
                     
-                    for idx, f in enumerate(selected):
-                        file_path = f.get('path', f.get('full_path', ''))
-                        parse_placeholder.info(f"📄 Processing {f.get('filename')}... ({idx+1}/{total_files})")
+                    try:
+                        text = extract_text_from_pdf(path)
+                        if not text.strip():
+                            parse_results.append({"filename": f.get('filename'), "error": "No text"})
+                            continue
                         
-                        # Download if cloud
-                        if f.get('source') != 'Mock Storage' and not os.path.exists(file_path):
-                            try:
-                                file_path = doc_storage.download_file(f)
-                            except Exception as e:
-                                parse_results.append({"filename": f.get('filename'), "error": str(e)})
-                                parse_progress.progress((idx + 1) / total_files)
-                                continue
+                        lobs = classify_lobs(model, text)
+                        results = []
+                        for lob in lobs:
+                            fields = extract_fields_chunked(model, text, lob)
+                            results.append({
+                                "lob": lob,
+                                "carrier": fields.get("carrier", ""),
+                                "evaluation_date": fields.get("evaluation_date", ""),
+                                "claims": fields.get("claims", [])
+                            })
+                            # Store for Excel generation
+                            all_parsed_results.append({
+                                'lob': lob,
+                                'carrier': fields.get('carrier', ''),
+                                'fields': fields,
+                                'source_file': f.get('filename')
+                            })
                         
-                        try:
-                            # Extract text
-                            parse_placeholder.info(f"📖 Extracting text from {f.get('filename')}...")
-                            text = ""
-                            with pdfplumber.open(file_path) as pdf:
-                                for page in pdf.pages:
-                                    text += (page.extract_text() or "") + "\n"
-                            
-                            if not text.strip():
-                                parse_results.append({"filename": f.get('filename'), "error": "No text extracted"})
-                                parse_progress.progress((idx + 1) / total_files)
-                                continue
-                            
-                            # Use existing OpenAI config
-                            if cfg:
-                                client = setup_openai_client(cfg)
-                                if client:
-                                    parse_placeholder.info(f"🤖 AI analyzing {f.get('filename')}...")
-                                    model = cfg.get('azure_deployment') if cfg.get('use_azure') else cfg.get('openai_model', 'gpt-4o-2024-08-06')
-                                    
-                                    lobs = classify_lobs_multi_openai(client, model, text)
-                                    results = []
-                                    for lob in lobs:
-                                        parse_placeholder.info(f"📊 Extracting {lob} claims from {f.get('filename')}...")
-                                        fields = extract_fields_openai_chunked(client, model, text, lob)
-                                        results.append({
-                                            "lob": lob,
-                                            "carrier": fields.get("carrier", ""),
-                                            "evaluation_date": fields.get("evaluation_date", ""),
-                                            "claims": fields.get("claims", [])
-                                        })
-                                    
-                                    parse_results.append({
-                                        "filename": f.get('filename'),
-                                        "success": True,
-                                        "detected_lobs": lobs,
-                                        "results": results
-                                    })
-                                else:
-                                    parse_results.append({"filename": f.get('filename'), "error": "No OpenAI client"})
+                        parse_results.append({
+                            "filename": f.get('filename'),
+                            "file_info": f,  # Store file info for email
+                            "success": True,
+                            "detected_lobs": lobs,
+                            "results": results
+                        })
+                    except Exception as e:
+                        parse_results.append({"filename": f.get('filename'), "error": str(e)})
+                    
+                    progress_bar.progress((idx + 1) / len(selected))
+                
+                status_text.success("Parsing complete!")
+                st.session_state['parse_results'] = parse_results
+                st.session_state['parsed_dataframes'] = results_to_dataframes(all_parsed_results)
+                st.session_state['parsed_files_for_email'] = [r.get('file_info') for r in parse_results if r.get('success') and r.get('file_info')]
+        
+        # Parse results section
+        if st.session_state.get('parse_results'):
+            st.markdown("---")
+            st.subheader("Parse Results")
+            
+            # Show parsed data
+            for res in st.session_state['parse_results']:
+                if res.get('error'):
+                    st.error(f"{res.get('filename')}: {res['error']}")
+                else:
+                    with st.expander(f"{res.get('filename')} - LOBs: {', '.join(res.get('detected_lobs', []))}", expanded=True):
+                        for lob_res in res.get('results', []):
+                            st.markdown(f"**{lob_res.get('lob')}** | Carrier: {lob_res.get('carrier')} | Eval Date: {lob_res.get('evaluation_date', 'N/A')}")
+                            claims = lob_res.get('claims', [])
+                            if claims:
+                                st.dataframe(pd.DataFrame(claims), use_container_width=True)
                             else:
-                                parse_results.append({"filename": f.get('filename'), "error": "No config.py found"})
-                                
-                        except Exception as e:
-                            parse_results.append({"filename": f.get('filename'), "error": str(e)})
-                        
-                        parse_progress.progress((idx + 1) / total_files)
-                    
-                    parse_progress.empty()
-                    success_parses = sum(1 for r in parse_results if r.get('success'))
-                    if success_parses == total_files:
-                        parse_placeholder.success(f"✅ Successfully parsed {success_parses}/{total_files} file(s)!")
-                    elif success_parses > 0:
-                        parse_placeholder.warning(f"⚠️ Parsed {success_parses}/{total_files} file(s). Some failed.")
-                    else:
-                        parse_placeholder.error(f"❌ Failed to parse files.")
-                    
-                    st.session_state['parse_results'] = parse_results
+                                st.info("No claims found for this LOB")
             
-            # ================================================================
-            # Section 6: Parse Results
-            # ================================================================
-            if 'parse_results' in st.session_state and st.session_state['parse_results']:
+            # Download Excel button
+            if st.session_state.get('parsed_dataframes'):
+                per_lob = st.session_state['parsed_dataframes']
+                if any(lob in per_lob and not per_lob[lob].empty for lob in ['AUTO', 'PROPERTY', 'GL', 'WC']):
+                    st.markdown("---")
+                    st.subheader("Download Parsed Data")
+                    st.download_button(
+                        "Download Excel Report",
+                        data=create_excel_download(per_lob),
+                        file_name=f"parsed_claims_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary"
+                    )
+            
+            # Email section for sending original PDFs and parsed Excel
+            parsed_files = st.session_state.get('parsed_files_for_email', [])
+            if parsed_files:
                 st.markdown("---")
-                st.subheader("📊 Parse Results")
+                st.subheader("Send Documents via Email")
+                st.info(f"{len(parsed_files)} parsed document(s) ready to send (Original PDFs + Parsed Excel Report)")
                 
-                for res in st.session_state['parse_results']:
-                    fname = res.get('filename', 'Unknown')
-                    
-                    if res.get('error'):
-                        st.error(f"❌ {fname}: {res['error']}")
-                    else:
-                        with st.expander(f"✅ {fname} - {', '.join(res.get('detected_lobs', []))}", expanded=True):
-                            for lob_res in res.get('results', []):
-                                st.markdown(f"**{lob_res.get('lob')}** | Carrier: {lob_res.get('carrier')} | Eval Date: {lob_res.get('evaluation_date')}")
-                                
-                                claims = lob_res.get('claims', [])
-                                if claims:
-                                    st.dataframe(pd.DataFrame(claims), use_container_width=True)
-                                else:
-                                    st.info("No claims found")
+                # Collect unique LOBs and their emails
+                lob_emails_parsed = {}
+                for f in parsed_files:
+                    lob = f.get('lob', 'UNKNOWN')
+                    if lob not in lob_emails_parsed:
+                        default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
+                        lob_emails_parsed[lob] = default_email
                 
-                # Export
-                if st.button("📥 Export to Excel"):
-                    all_claims = []
-                    for res in st.session_state['parse_results']:
-                        if res.get('success'):
-                            for lob_res in res.get('results', []):
-                                for claim in lob_res.get('claims', []):
-                                    claim['lob'] = lob_res.get('lob')
-                                    claim['carrier'] = lob_res.get('carrier')
-                                    claim['source'] = res.get('filename')
-                                    all_claims.append(claim)
-                    
-                    if all_claims:
-                        df = pd.DataFrame(all_claims)
-                        output = io.BytesIO()
-                        df.to_excel(output, index=False)
-                        output.seek(0)
-                        
-                        st.download_button(
-                            "⬇️ Download Excel",
-                            data=output.getvalue(),
-                            file_name="parsed_claims.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                # Editable email inputs
+                edited_emails_parsed = {}
+                for lob, default_email in lob_emails_parsed.items():
+                    col_lob, col_email = st.columns([1, 3])
+                    with col_lob:
+                        st.markdown(f"**{lob}:**")
+                    with col_email:
+                        edited_emails_parsed[lob] = st.text_input(
+                            f"Email for {lob} (parsed)",
+                            value=default_email,
+                            key=f"parsed_email_{lob}",
+                            label_visibility="collapsed",
+                            placeholder="Enter email address(es), comma-separated"
                         )
+                
+                # CC Recipients
+                cc_emails_parsed = st.text_input(
+                    "CC Recipients",
+                    value="",
+                    placeholder="Enter CC email addresses, comma-separated",
+                    key="parsed_cc_emails"
+                )
+                
+                # Checkbox options
+                col_opt1, col_opt2 = st.columns(2)
+                with col_opt1:
+                    include_original_pdfs = st.checkbox("Include Original PDFs", value=True, key="include_pdfs")
+                with col_opt2:
+                    include_excel_report = st.checkbox("Include Parsed Excel Report", value=True, key="include_excel")
+                
+                # Send button
+                if st.button("Send Documents to LOB Emails", type="primary", key="send_parsed_emails"):
+                    # Generate Excel data if needed
+                    excel_data = None
+                    excel_filename = None
+                    if include_excel_report and st.session_state.get('parsed_dataframes'):
+                        per_lob = st.session_state['parsed_dataframes']
+                        if any(lob in per_lob and not per_lob[lob].empty for lob in ['AUTO', 'PROPERTY', 'GL', 'WC']):
+                            excel_data = create_excel_download(per_lob)
+                            excel_filename = f"parsed_claims_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    
+                    for f in parsed_files:
+                        lob = f.get('lob', 'UNKNOWN')
+                        recipient = edited_emails_parsed.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
+                        
+                        # Get PDF path if including original
+                        pdf_path = None
+                        if include_original_pdfs:
+                            pdf_path = f.get('path', f.get('full_path', ''))
+                        
+                        success, msg = send_email_action(
+                            f, 
+                            lob, 
+                            f.get('policy_number', ''), 
+                            recipient_override=recipient,
+                            cc_emails=cc_emails_parsed if cc_emails_parsed else None,
+                            excel_attachment=excel_data if include_excel_report else None,
+                            excel_filename=excel_filename,
+                            include_pdf=include_original_pdfs
+                        )
+                        if success:
+                            st.toast(f"{f.get('filename')}: {msg}", icon="✅")
+                        else:
+                            st.error(f"{f.get('filename')}: {msg}")
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    # Sidebar
+    render_sidebar()
+    
+    # Tabs - AI Agent first, PDF Parser second
+    tab1, tab2 = st.tabs(["AI Agent", "PDF Parser"])
+    
+    with tab1:
+        render_ai_agent_tab()
+    
+    with tab2:
+        render_pdf_parser_tab()
+
 
 if __name__ == "__main__":
     main()

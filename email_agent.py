@@ -1,144 +1,124 @@
+"""
+Email Agent Module
+==================
+LangGraph-based agent for document search and email sending.
+
+Robust Search Logic:
+1. Search folder names (account, lob, policy)
+2. Search filenames (loss_run pattern)
+3. If not found, open PDFs and search content
+4. Validate matches before sending
+"""
+
 import os
-import glob
 import smtplib
-from typing import TypedDict, Annotated, List, Dict, Optional
+from typing import TypedDict, List, Dict, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
 import dotenv
 
-# Load environment variables
 dotenv.load_dotenv()
 
-# Import Storage - Uses cloud storage (Azure/OneDrive) if configured, falls back to mock
+# Import storage module
 try:
     import cloud_storage as storage
-    print("☁️ Using cloud storage module")
 except ImportError:
     import mock_storage as storage
-    print("📁 Using mock storage module")
 
-# ============================================================================
-# Configuration
-# ============================================================================
+# =============================================================================
+# Constants
+# =============================================================================
 
-# Mock Email Database
+VALID_ACCOUNTS = ["Amex", "Chubbs", "GlobalInsure", "TechCorp", "Travelers", "WESLACO_ISD"]
+VALID_LOBS = ["AUTO", "PROPERTY", "GL", "WC", "InlandMarine"]
+
 LOB_EMAILS = {
-    "AUTO": "madhumadhu112120052@gmail.com",
-    "PROPERTY": "madhumadhu112120052@gmail.com",
-    "GL": "madhumadhu112120052@gmail.com",
-    "WC": "madhumadhu112120052@gmail.com",
-    "UNKNOWN": "madhumadhu112120052@gmail.com"
+    "AUTO": os.getenv("AUTO_EMAIL", "claims-auto@company.com"),
+    "PROPERTY": os.getenv("PROPERTY_EMAIL", "claims-property@company.com"),
+    "GL": os.getenv("GL_EMAIL", "claims-gl@company.com"),
+    "WC": os.getenv("WC_EMAIL", "claims-wc@company.com"),
+    "InlandMarine": os.getenv("INLANDMARINE_EMAIL", "claims-marine@company.com"),
+    "UNKNOWN": os.getenv("DEFAULT_EMAIL", "claims@company.com")
 }
 
-# ============================================================================
+# =============================================================================
 # State Definition
-# ============================================================================
+# =============================================================================
 
 class AgentState(TypedDict):
     user_query: str
     account_name: Optional[str]
+    insured_name: Optional[str]
     policy_number: Optional[str]
     lob: Optional[str]
-    date: Optional[str]
+    start_year: Optional[str]
+    end_year: Optional[str]
     found_files: List[Dict[str, str]]
+    validated_files: List[Dict[str, str]]
     email_sent: bool
     error: Optional[str]
     logs: List[str]
 
-# ============================================================================
-# Models
-# ============================================================================
+# =============================================================================
+# Agent Nodes
+# =============================================================================
 
-class ExtractionResult(BaseModel):
-    account_name: str = Field(description="The name of the Account or Company (e.g., Chubbs, Amex).")
-    policy_number: str = Field(description="The policy number or claim number.")
-    lob: str = Field(description="The Line of Business (AUTO, PROPERTY, GL, WC). Map 'work' to WC, 'vehicle' to AUTO.")
-    date: str = Field(description="The effective date or report date mentioned (format: DD-MM-YYYY).")
-
-# ============================================================================
-# Nodes
-# ============================================================================
-
-# ============================================================================
-# Valid Accounts and LOBs (derived from mock_documents structure)
-# ============================================================================
-
-VALID_ACCOUNTS = ["Amex", "Chubbs", "GlobalInsure", "TechCorp", "Travelers"]
-VALID_LOBS = ["AUTO", "PROPERTY", "GL", "WC"]
-
-def extract_info_node(state: AgentState):
-    """
-    Extracts Account, Policy, LoB, and Date from the user query using Gemini.
-    """
-    print("--- Extracting Info ---")
+def extract_info_node(state: AgentState) -> Dict:
+    """Extract search criteria from user query using Gemini."""
     query = state['user_query']
     
     if not os.getenv("GOOGLE_API_KEY"):
         return {
-            "error": "GOOGLE_API_KEY not found in environment variables.",
+            "error": "GOOGLE_API_KEY not found",
             "logs": state['logs'] + ["Error: Missing GOOGLE_API_KEY"]
         }
 
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    
-    parser = JsonOutputParser(pydantic_object=ExtractionResult)
-    
-    # Build dynamic prompt with all valid accounts and LOBs
-    accounts_list = ", ".join(VALID_ACCOUNTS)
-    lobs_list = ", ".join(VALID_LOBS)
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", f"""You are an expert insurance document retrieval assistant. Your task is to extract structured information from the user's natural language request.
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import JsonOutputParser
+        from pydantic import BaseModel, Field
+        
+        class ExtractionResult(BaseModel):
+            account_name: str = Field(description="Account name")
+            insured_name: str = Field(description="Insured name if different from account")
+            policy_number: str = Field(description="Policy number")
+            lob: str = Field(description="Line of Business (AUTO, PROPERTY, GL, WC, InlandMarine)")
+            start_year: str = Field(description="Start year (YYYY format)")
+            end_year: str = Field(description="End year (YYYY format)")
 
-**Valid Account Names:** {accounts_list}
-**Valid Lines of Business (LoB):** {lobs_list}
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        parser = JsonOutputParser(pydantic_object=ExtractionResult)
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""Extract document search criteria from user query.
+Valid Accounts: {', '.join(VALID_ACCOUNTS)}
+Valid LOBs: {', '.join(VALID_LOBS)}
 
-**Extraction Rules:**
-1. **Account Name**: Match the user's input to one of the valid accounts. Handle variations:
-   - "amex", "AMEX", "American Express" → "Amex"
-   - "chubbs", "chubb", "CHUBBS" → "Chubbs"
-   - "globalinsure", "global insure", "global" → "GlobalInsure"
-   - "techcorp", "tech corp", "tech" → "TechCorp"
-   - "travelers", "traveler", "TRAVELERS" → "Travelers"
-
-2. **Line of Business (LoB)**: Map user terms to valid LOBs:
-   - "auto", "vehicle", "car", "automobile", "motor", "accident" → "AUTO"
-   - "property", "home", "house", "fire", "building", "real estate" → "PROPERTY"
-   - "gl", "general liability", "liability", "general" → "GL"
-   - "wc", "work", "workers comp", "workers compensation", "worker", "workplace", "injury" → "WC"
-
-3. **Policy Number**: Extract any numeric identifier (policy number, claim number, reference number).
-
-4. **Date**: Extract any date mentioned. Convert to format DD-MM-YYYY (e.g., "21-09-2024").
-   - Handle formats like "21/09/2024", "September 21, 2024", "21 Sep 2024", etc.
-
-**Important:** 
-- Be flexible with spelling variations and typos.
-- If unsure about account name, use the closest match from the valid list.
-- Return ONLY valid JSON matching the schema.
+Rules:
+- Map variations: "chubbs/chubb" → "Chubbs", "amex" → "Amex", "weslaco" → "WESLACO_ISD"
+- Map LOBs: "auto/vehicle" → "AUTO", "work/wc" → "WC", "property/home" → "PROPERTY", "gl/liability" → "GL", "marine/inland" → "InlandMarine"
+- Extract year ranges: "2023-2024" → start_year: "2023", end_year: "2024"
+- If only one year given, use it for both start and end
+- "loss run" or "loss runs" indicates looking for loss run reports
 
 {{format_instructions}}"""),
-        ("user", "{query}")
-    ])
-    
-    chain = prompt | llm | parser
-    
-    try:
+            ("user", "{query}")
+        ])
+        
+        chain = prompt | llm | parser
         result = chain.invoke({"query": query, "format_instructions": parser.get_format_instructions()})
-        print(f"Extracted: {result}")
+        
         return {
             "account_name": result.get("account_name"),
+            "insured_name": result.get("insured_name"),
             "policy_number": result.get("policy_number"),
-            "lob": result.get("lob").upper(),
-            "date": result.get("date"),
+            "lob": result.get("lob", "").upper() if result.get("lob") else None,
+            "start_year": result.get("start_year"),
+            "end_year": result.get("end_year"),
             "logs": state['logs'] + [f"Extracted: {result}"]
         }
     except Exception as e:
@@ -147,62 +127,123 @@ def extract_info_node(state: AgentState):
             "logs": state['logs'] + [f"Extraction Error: {str(e)}"]
         }
 
-def locate_document_node(state: AgentState):
+
+def locate_document_node(state: AgentState) -> Dict:
     """
-    Searches for the PDF file using cloud storage (Azure/OneDrive) or mock storage.
+    Search for documents by folder structure and filenames:
+    1. Search folder names (account, lob, policy)
+    2. Search filenames (loss_run pattern with year range)
     """
-    print("--- Locating Document ---")
     if state.get("error"):
         return state
 
-    account = state['account_name']
-    lob = state['lob']
-    policy = state['policy_number']
-    date = state['date']
+    # Use the search function
+    found_files = storage.search_files(
+        account_name=state.get('account_name'),
+        lob=state.get('lob'),
+        policy_number=state.get('policy_number'),
+        insured_name=state.get('insured_name'),
+        start_year=state.get('start_year'),
+        end_year=state.get('end_year')
+    )
     
-    found_files = storage.search_files(account, lob, policy, date)
-    
-    if found_files:
-        print(f"Found {len(found_files)} files.")
-        return {
-            "found_files": found_files,
-            "logs": state['logs'] + [f"Found {len(found_files)} files in storage."]
-        }
-    else:
-        return {
-            "found_files": [],
-            "logs": state['logs'] + ["No files found matching criteria."]
-        }
+    return {
+        "found_files": found_files,
+        "logs": state['logs'] + [f"Found {len(found_files)} files via folder/filename/content search"]
+    }
 
-# Note: send_email_node is now intended to be called explicitly by the UI, 
-# but we keep it in the graph if we want an automated flow. 
-# For this requirement, the user wants to click a button.
-# We will expose a separate function for sending email.
 
-def send_email_action(file_info: Dict[str, str], lob: str, policy_number: str):
+def validate_documents_node(state: AgentState) -> Dict:
     """
-    Standalone function to send email, called by UI.
-    Handles both local files and cloud storage files.
+    Validate found documents by checking PDF content matches criteria.
+    """
+    if state.get("error"):
+        return state
+    
+    found_files = state.get('found_files', [])
+    validated_files = []
+    
+    for file_info in found_files:
+        file_path = file_info.get('path', file_info.get('full_path', ''))
+        
+        # Use validation function if available
+        if hasattr(storage, 'validate_document'):
+            date_range = None
+            if state.get('start_year') and state.get('end_year'):
+                date_range = (state['start_year'], state['end_year'])
+            
+            validation = storage.validate_document(
+                file_path,
+                policy_number=state.get('policy_number'),
+                date_range=date_range
+            )
+            
+            if validation.get('valid', True):
+                file_info['validated'] = True
+                validated_files.append(file_info)
+            else:
+                # Still include but mark as unvalidated
+                file_info['validated'] = False
+                file_info['validation_errors'] = validation.get('errors', [])
+                validated_files.append(file_info)
+        else:
+            # No validation available, include all
+            file_info['validated'] = True
+            validated_files.append(file_info)
+    
+    return {
+        "validated_files": validated_files,
+        "logs": state['logs'] + [f"Validated {len(validated_files)} files"]
+    }
+
+# =============================================================================
+# Email Functions
+# =============================================================================
+
+def send_email_action(
+    file_info: Dict[str, str], 
+    lob: str, 
+    policy_number: str, 
+    recipient_override: str = None,
+    cc_emails: str = None,
+    excel_attachment: bytes = None,
+    excel_filename: str = None,
+    include_pdf: bool = True
+) -> tuple:
+    """
+    Send email with document attachments (PDF and/or Excel).
     
     Args:
-        file_info: Dictionary with file information (from search results)
+        file_info: File information dictionary
         lob: Line of Business
         policy_number: Policy number
+        recipient_override: Optional custom recipient email (overrides default LOB email)
+        cc_emails: Optional CC email addresses (comma-separated)
+        excel_attachment: Optional Excel file data as bytes
+        excel_filename: Optional Excel filename
+        include_pdf: Whether to include the original PDF
+    
+    Returns:
+        Tuple of (success: bool, message: str)
     """
-    recipient = LOB_EMAILS.get(lob, LOB_EMAILS["UNKNOWN"])
+    # Use override if provided, otherwise use default LOB email
+    if recipient_override:
+        recipient = recipient_override
+    else:
+        recipient = LOB_EMAILS.get(lob, LOB_EMAILS["UNKNOWN"])
     
-    # Get local file path - download from cloud if needed
-    try:
-        if file_info.get("source") == "Mock Storage":
-            file_path = file_info.get("path", file_info.get("full_path", ""))
-        else:
-            # Download from cloud storage to temp location
-            file_path = storage.download_file(file_info)
-    except Exception as e:
-        return False, f"Failed to get file: {str(e)}"
-    subject = f"Claims Document for Policy {policy_number} ({lob})"
-    body = f"Please find attached the claims document for Policy {policy_number}."
+    # Get file path for PDF
+    file_path = None
+    if include_pdf:
+        try:
+            if file_info.get("source") == "Mock Storage":
+                file_path = file_info.get("path", file_info.get("full_path", ""))
+            else:
+                file_path = storage.download_file(file_info)
+        except Exception as e:
+            return False, f"Failed to get file: {str(e)}"
     
+    # Email configuration
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_username = os.getenv("SMTP_USERNAME")
@@ -211,81 +252,116 @@ def send_email_action(file_info: Dict[str, str], lob: str, policy_number: str):
     if not smtp_username or not smtp_password:
         return False, "Missing SMTP credentials"
 
+    # Compose email
     msg = MIMEMultipart()
     msg['From'] = smtp_username
     msg['To'] = recipient
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
+    
+    # Add CC if provided
+    if cc_emails:
+        msg['Cc'] = cc_emails
+    
+    msg['Subject'] = f"Claims Document for Policy {policy_number} ({lob})"
+    
+    # Build email body
+    body_parts = [f"Please find attached the claims document(s) for Policy {policy_number}."]
+    attachments_list = []
+    if include_pdf and file_path:
+        attachments_list.append("Original PDF document")
+    if excel_attachment:
+        attachments_list.append("Parsed Excel report")
+    if attachments_list:
+        body_parts.append(f"\nAttachments: {', '.join(attachments_list)}")
+    
+    msg.attach(MIMEText('\n'.join(body_parts), 'plain'))
     
     try:
-        with open(file_path, "rb") as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
-        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
-        msg.attach(part)
+        # Attach PDF if requested
+        if include_pdf and file_path:
+            with open(file_path, "rb") as f:
+                part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
+            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
+            msg.attach(part)
+        
+        # Attach Excel if provided
+        if excel_attachment and excel_filename:
+            excel_part = MIMEApplication(excel_attachment, Name=excel_filename)
+            excel_part['Content-Disposition'] = f'attachment; filename="{excel_filename}"'
+            msg.attach(excel_part)
+        
+        # Determine all recipients (To + CC)
+        all_recipients = [recipient]
+        if cc_emails:
+            all_recipients.extend([email.strip() for email in cc_emails.split(',') if email.strip()])
         
         with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
             server.login(smtp_username, smtp_password)
             server.send_message(msg)
-            
-        return True, f"Email sent to {recipient}"
+        
+        cc_info = f" (CC: {cc_emails})" if cc_emails else ""
+        return True, f"Email sent to {recipient}{cc_info}"
     except Exception as e:
         return False, str(e)
 
-# ============================================================================
+# =============================================================================
 # Graph Construction
-# ============================================================================
+# =============================================================================
 
 def build_graph():
+    """Build the LangGraph workflow with validation step."""
     workflow = StateGraph(AgentState)
     
     workflow.add_node("extract_info", extract_info_node)
     workflow.add_node("locate_document", locate_document_node)
+    workflow.add_node("validate_documents", validate_documents_node)
     
     workflow.set_entry_point("extract_info")
-    
     workflow.add_edge("extract_info", "locate_document")
-    workflow.add_edge("locate_document", END)
+    workflow.add_edge("locate_document", "validate_documents")
+    workflow.add_edge("validate_documents", END)
     
     return workflow.compile()
 
-# ============================================================================
-# Main Execution
-# ============================================================================
+
+# =============================================================================
+# Main
+# =============================================================================
 
 if __name__ == "__main__":
-    # Initialize Mock Data (only if using mock storage)
+    # Initialize mock data
     if hasattr(storage, 'create_mock_data'):
         storage.create_mock_data()
 
-    # Initialize Graph
+    # Test the agent
     app = build_graph()
     
-    # Example User Query
-    user_input = "chubbs work 2456 date 21-09-2024"
+    user_input = "chubbs auto policy 2456 loss run 2023-2024"
     print(f"\n🤖 User Query: '{user_input}'\n")
     
     initial_state = {
         "user_query": user_input,
         "account_name": None,
+        "insured_name": None,
         "policy_number": None,
         "lob": None,
-        "date": None,
+        "start_year": None,
+        "end_year": None,
         "found_files": [],
+        "validated_files": [],
         "email_sent": False,
         "error": None,
         "logs": []
     }
     
-    # Run the graph
     result = app.invoke(initial_state)
     
-    print("\n--- Final State ---")
+    print("\n--- Result ---")
     if result.get("error"):
         print(f"❌ Error: {result['error']}")
     else:
-        print("✅ Workflow Completed Successfully")
-        print(f"Extracted: Account={result['account_name']}, LoB={result['lob']}, Policy={result['policy_number']}, Date={result['date']}")
-        print(f"Files Found: {len(result['found_files'])}")
-        for f in result['found_files']:
-            print(f" - {f['filename']} ({f['source']})")
+        print(f"✅ Found {len(result['found_files'])} files")
+        print(f"✅ Validated {len(result.get('validated_files', []))} files")
+        for f in result.get('validated_files', result['found_files']):
+            status = "✓" if f.get('validated', True) else "?"
+            print(f"   [{status}] 📄 {f['filename']} ({f['account']}/{f['lob']}/{f['policy_number']})")

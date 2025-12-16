@@ -1,20 +1,27 @@
+# Core Streamlit
 streamlit>=1.28.0
+
+# AI/ML
 openai>=1.30.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-pdfplumber>=0.10.0
 langchain>=0.1.0
 langchain-google-genai>=0.0.5
 langgraph>=0.0.10
+
+# Data Processing
+pandas>=2.0.0
+openpyxl>=3.1.0
 pydantic>=2.0.0
-python-dotenv
-fpdf
+
+# PDF Processing
+pdfplumber>=0.10.0
+fpdf>=1.7.2
+
+# Utilities
+python-dotenv>=1.0.0
 requests>=2.31.0
 
-# Azure Blob Storage
+# Azure Storage (optional)
 azure-storage-blob>=12.19.0
 
-# Microsoft Graph API (OneDrive)
+# Microsoft Graph API - OneDrive (optional)
 msal>=1.24.0
-
-
