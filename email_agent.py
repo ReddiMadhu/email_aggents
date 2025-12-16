@@ -3,19 +3,11 @@ Email Agent Module
 ==================
 LangGraph-based agent for document search and email sending.
 
-Robust Search Logic:
-1. Search folder names (account, lob, policy)
-2. Search filenames (loss_run pattern)
-3. If not found, open PDFs and search content
-4. Validate matches before sending
+Uses Outlook for email via win32com.
 """
 
 import os
-import smtplib
 from typing import TypedDict, List, Dict, Optional
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
 
 from langgraph.graph import StateGraph, END
 import dotenv
@@ -27,6 +19,9 @@ try:
     import cloud_storage as storage
 except ImportError:
     import mock_storage as storage
+
+# Import Outlook email module
+from outlook_email import send_document_email, is_outlook_available
 
 # =============================================================================
 # Constants
@@ -211,7 +206,7 @@ def send_email_action(
     include_pdf: bool = True
 ) -> tuple:
     """
-    Send email with document attachments (PDF and/or Excel).
+    Send email with document attachments via Outlook.
     
     Args:
         file_info: File information dictionary
@@ -232,77 +227,17 @@ def send_email_action(
     else:
         recipient = LOB_EMAILS.get(lob, LOB_EMAILS["UNKNOWN"])
     
-    # Get file path for PDF
-    file_path = None
-    if include_pdf:
-        try:
-            if file_info.get("source") == "Mock Storage":
-                file_path = file_info.get("path", file_info.get("full_path", ""))
-            else:
-                file_path = storage.download_file(file_info)
-        except Exception as e:
-            return False, f"Failed to get file: {str(e)}"
-    
-    # Email configuration
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_username = os.getenv("SMTP_USERNAME")
-    smtp_password = os.getenv("SMTP_PASSWORD")
-
-    if not smtp_username or not smtp_password:
-        return False, "Missing SMTP credentials"
-
-    # Compose email
-    msg = MIMEMultipart()
-    msg['From'] = smtp_username
-    msg['To'] = recipient
-    
-    # Add CC if provided
-    if cc_emails:
-        msg['Cc'] = cc_emails
-    
-    msg['Subject'] = f"Claims Document for Policy {policy_number} ({lob})"
-    
-    # Build email body
-    body_parts = [f"Please find attached the claims document(s) for Policy {policy_number}."]
-    attachments_list = []
-    if include_pdf and file_path:
-        attachments_list.append("Original PDF document")
-    if excel_attachment:
-        attachments_list.append("Parsed Excel report")
-    if attachments_list:
-        body_parts.append(f"\nAttachments: {', '.join(attachments_list)}")
-    
-    msg.attach(MIMEText('\n'.join(body_parts), 'plain'))
-    
-    try:
-        # Attach PDF if requested
-        if include_pdf and file_path:
-            with open(file_path, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(file_path))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(file_path)}"'
-            msg.attach(part)
-        
-        # Attach Excel if provided
-        if excel_attachment and excel_filename:
-            excel_part = MIMEApplication(excel_attachment, Name=excel_filename)
-            excel_part['Content-Disposition'] = f'attachment; filename="{excel_filename}"'
-            msg.attach(excel_part)
-        
-        # Determine all recipients (To + CC)
-        all_recipients = [recipient]
-        if cc_emails:
-            all_recipients.extend([email.strip() for email in cc_emails.split(',') if email.strip()])
-        
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_username, smtp_password)
-            server.send_message(msg)
-        
-        cc_info = f" (CC: {cc_emails})" if cc_emails else ""
-        return True, f"Email sent to {recipient}{cc_info}"
-    except Exception as e:
-        return False, str(e)
+    # Use Outlook email
+    return send_document_email(
+        file_info=file_info,
+        lob=lob,
+        policy_number=policy_number,
+        recipient=recipient,
+        cc_emails=cc_emails,
+        excel_attachment=excel_attachment,
+        excel_filename=excel_filename,
+        include_pdf=include_pdf
+    )
 
 # =============================================================================
 # Graph Construction

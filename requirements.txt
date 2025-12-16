@@ -17,6 +17,9 @@ pdfplumber>=0.10.0
 # Utilities
 python-dotenv>=1.0.0
 
+# Outlook Email (Windows)
+pywin32>=306
+
 # Azure Storage (optional)
 azure-storage-blob>=12.19.0
 
