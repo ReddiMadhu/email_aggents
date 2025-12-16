@@ -1,11 +1,10 @@
 # Core Streamlit
 streamlit>=1.28.0
 
-# AI/ML
-openai>=1.30.0
-langchain>=0.1.0
-langchain-google-genai>=0.0.5
-langgraph>=0.0.10
+# AI/ML - LangChain OpenAI
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
 
 # Data Processing
 pandas>=2.0.0
@@ -14,11 +13,9 @@ pydantic>=2.0.0
 
 # PDF Processing
 pdfplumber>=0.10.0
-fpdf>=1.7.2
 
 # Utilities
 python-dotenv>=1.0.0
-requests>=2.31.0
 
 # Azure Storage (optional)
 azure-storage-blob>=12.19.0

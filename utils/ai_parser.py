@@ -1,7 +1,7 @@
 """
 AI Parser Module
 ================
-AI-powered document parsing using Google Gemini.
+AI-powered document parsing using LangChain ChatOpenAI.
 """
 
 import json
@@ -76,12 +76,12 @@ LOB_KEYWORDS = {
 }
 
 
-def classify_lobs(model, text: str) -> List[str]:
+def classify_lobs(llm, text: str) -> List[str]:
     """
     Classify Lines of Business from text content.
     
     Args:
-        model: Gemini GenerativeModel instance
+        llm: ChatOpenAI LLM instance
         text: Document text
     
     Returns:
@@ -96,8 +96,8 @@ Content:\n{text[:10000]}
 """
     
     try:
-        response = model.generate_content(prompt)
-        content = response.text.strip()
+        response = llm.invoke(prompt)
+        content = response.content.strip()
         
         # Clean markdown if present
         if content.startswith("```"):
@@ -140,12 +140,12 @@ def _detect_lobs_by_keywords(text: str) -> List[str]:
     return found or ["AUTO"]
 
 
-def extract_fields(model, text: str, lob: str) -> Dict:
+def extract_fields(llm, text: str, lob: str) -> Dict:
     """
     Extract structured fields from text for a specific LoB.
     
     Args:
-        model: Gemini GenerativeModel instance
+        llm: ChatOpenAI LLM instance
         text: Document text
         lob: Line of Business
     
@@ -173,8 +173,8 @@ Content:\n{text}
     
     for attempt in range(max_attempts):
         try:
-            response = model.generate_content(prompt)
-            content = response.text.strip()
+            response = llm.invoke(prompt)
+            content = response.content.strip()
             
             # Clean markdown if present
             if content.startswith("```"):
@@ -199,7 +199,7 @@ Content:\n{text}
 
 
 def extract_fields_chunked(
-    model, 
+    llm, 
     text: str, 
     lob: str,
     progress_callback: Optional[callable] = None
@@ -208,7 +208,7 @@ def extract_fields_chunked(
     Extract fields with chunking for long documents.
     
     Args:
-        model: Gemini GenerativeModel instance
+        llm: ChatOpenAI LLM instance
         text: Document text
         lob: Line of Business
         progress_callback: Optional callback(current, total) for progress
@@ -226,7 +226,7 @@ def extract_fields_chunked(
         if progress_callback:
             progress_callback(idx + 1, len(chunks))
         
-        result = extract_fields(model, chunk, lob)
+        result = extract_fields(llm, chunk, lob)
         
         # Merge results
         if result.get('evaluation_date') and not merged['evaluation_date']:
@@ -252,16 +252,23 @@ def parse_pdf_document(file_path: str) -> Dict:
         Dictionary with parsing results.
     """
     try:
-        import google.generativeai as genai
+        from langchain_openai import ChatOpenAI
         
-        # Get API key from environment
-        api_key = os.getenv("GOOGLE_API_KEY")
+        # Get config from environment
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        
         if not api_key:
-            return {"error": "GOOGLE_API_KEY not set in .env"}
+            return {"error": "OPENAI_API_KEY not set in .env"}
         
-        # Setup Gemini
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        # Setup ChatOpenAI
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0
+        )
         
         # Extract text
         text_content = extract_text_from_pdf(file_path)
@@ -269,12 +276,12 @@ def parse_pdf_document(file_path: str) -> Dict:
             return {"error": "Could not extract text from PDF"}
         
         # Classify LOBs
-        lobs = classify_lobs(model, text_content)
+        lobs = classify_lobs(llm, text_content)
         
         # Extract fields for each LOB
         results = []
         for lob in lobs:
-            fields = extract_fields_chunked(model, text_content, lob)
+            fields = extract_fields_chunked(llm, text_content, lob)
             results.append({
                 "lob": lob,
                 "carrier": fields.get("carrier", ""),

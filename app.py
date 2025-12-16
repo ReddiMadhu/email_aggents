@@ -34,28 +34,36 @@ except ImportError:
 from email_agent import send_email_action, VALID_ACCOUNTS, VALID_LOBS, LOB_EMAILS
 
 # =============================================================================
-# API Setup - Use Google Gemini by default
+# API Setup - Use ChatOpenAI (OpenAI compatible)
 # =============================================================================
 
-def get_google_api_key() -> Optional[str]:
-    """Get Google API key from environment."""
-    return os.getenv("GOOGLE_API_KEY")
+def get_llm_config() -> Dict:
+    """Get LLM configuration from environment."""
+    return {
+        "api_key": os.getenv("OPENAI_API_KEY", ""),
+        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    }
 
-def setup_gemini_client():
-    """Setup Google Gemini client."""
-    api_key = get_google_api_key()
-    if not api_key:
+def get_llm():
+    """Get ChatOpenAI LLM instance."""
+    config = get_llm_config()
+    if not config["api_key"]:
         return None
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        return genai
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=config["model"],
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            temperature=0
+        )
     except Exception:
         return None
 
 def get_model_name() -> str:
-    """Get the default model name."""
-    return "gemini-2.0-flash"
+    """Get the model name from config."""
+    return get_llm_config()["model"]
 
 # =============================================================================
 # Page Configuration
@@ -477,7 +485,7 @@ def render_pdf_parser_tab():
     """Render the PDF Parser tab."""
     st.markdown("Upload insurance claims PDFs to extract structured data.")
     
-    api_key = get_google_api_key()
+    llm = get_llm()
     
     # File uploader
     uploaded_files = st.file_uploader(
@@ -490,17 +498,9 @@ def render_pdf_parser_tab():
         st.info(f"{len(uploaded_files)} file(s) uploaded")
     
     # Process button
-    if st.button("Process PDFs", type="primary", disabled=not uploaded_files or not api_key):
-        if not api_key:
-            st.error("GOOGLE_API_KEY not set in .env")
-            return
-        
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(get_model_name())
-        except Exception as e:
-            st.error(f"Failed to setup Gemini: {e}")
+    if st.button("Process PDFs", type="primary", disabled=not uploaded_files or not llm):
+        if not llm:
+            st.error("OPENAI_API_KEY not set in .env")
             return
         
         all_results = []
@@ -516,11 +516,11 @@ def render_pdf_parser_tab():
                 continue
             
             status.info(f"Detecting LOBs in {pdf_file.name}")
-            lobs = classify_lobs(model, text)
+            lobs = classify_lobs(llm, text)
             
             for lob in lobs:
                 status.info(f"Extracting {lob} claims from {pdf_file.name}")
-                fields = extract_fields_chunked(model, text, lob)
+                fields = extract_fields_chunked(llm, text, lob)
                 
                 all_results.append({
                     'lob': lob,
@@ -582,11 +582,11 @@ def render_pdf_parser_tab():
 
 def extract_search_criteria(query: str) -> Dict:
     """Extract search criteria from natural language query."""
-    if not get_google_api_key():
+    llm = get_llm()
+    if not llm:
         return {}
     
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_core.output_parsers import JsonOutputParser
         from pydantic import BaseModel, Field
@@ -599,7 +599,6 @@ def extract_search_criteria(query: str) -> Dict:
             start_year: str = Field(default="", description="Start year YYYY")
             end_year: str = Field(default="", description="End year YYYY")
         
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
         parser = JsonOutputParser(pydantic_object=ExtractedInfo)
         
         prompt = ChatPromptTemplate.from_messages([
@@ -834,14 +833,10 @@ def render_ai_agent_tab():
                         st.error(f"{f.get('filename')}: {msg}")
         
         with col_parse:
-            api_key = get_google_api_key()
-            if st.button("Parse PDF", disabled=len(selected) == 0 or not api_key, type="primary"):
-                try:
-                    import google.generativeai as genai
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel(get_model_name())
-                except Exception as e:
-                    st.error(f"Failed to setup Gemini: {e}")
+            llm = get_llm()
+            if st.button("Parse PDF", disabled=len(selected) == 0 or not llm, type="primary"):
+                if not llm:
+                    st.error("OPENAI_API_KEY not set in .env")
                     return
                 
                 parse_results = []
@@ -860,10 +855,10 @@ def render_ai_agent_tab():
                             parse_results.append({"filename": f.get('filename'), "error": "No text"})
                             continue
                         
-                        lobs = classify_lobs(model, text)
+                        lobs = classify_lobs(llm, text)
                         results = []
                         for lob in lobs:
-                            fields = extract_fields_chunked(model, text, lob)
+                            fields = extract_fields_chunked(llm, text, lob)
                             results.append({
                                 "lob": lob,
                                 "carrier": fields.get("carrier", ""),
