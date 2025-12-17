@@ -740,73 +740,74 @@ def render_ai_agent_tab():
         st.subheader("Documents")
         
         files = st.session_state['agent_files']
-        selected = st.session_state.get('selected_agent_files', [])
         
-        for idx, f in enumerate(files):
-            col_chk, col_info = st.columns([0.5, 9.5])
-            
-            with col_chk:
-                is_sel = st.checkbox("", key=f"sel_{idx}", value=f in selected)
-                if is_sel and f not in selected:
-                    selected.append(f)
-                elif not is_sel and f in selected:
-                    selected.remove(f)
-            
-            with col_info:
-                # Updated display to show new structure info
-                date_range = f.get('date_range', f"{f.get('start_year', '')}-{f.get('end_year', '')}")
-                with st.expander(f"{f.get('filename')} | {f.get('account')} | {f.get('lob')} | {date_range}"):
-                    st.markdown(f"""
+        # Create options for radio button selection
+        file_options = []
+        for f in files:
+            date_range = f.get('date_range', f"{f.get('start_year', '')}-{f.get('end_year', '')}")
+            file_options.append(f"{f.get('filename')} | {f.get('account')} | {f.get('lob')} | {date_range}")
+        
+        # Single file selection with radio buttons
+        selected_idx = st.radio(
+            "Select a document:",
+            options=range(len(files)),
+            format_func=lambda x: file_options[x],
+            key="file_selection_radio"
+        )
+        
+        # Get the selected file
+        selected_file = files[selected_idx] if selected_idx is not None else None
+        
+        # Show details of selected file in expander
+        if selected_file:
+            date_range = selected_file.get('date_range', f"{selected_file.get('start_year', '')}-{selected_file.get('end_year', '')}")
+            with st.expander("Selected Document Details", expanded=True):
+                st.markdown(f"""
 | Field | Value |
 |-------|-------|
-| **Account** | {f.get('account', 'N/A')} |
-| **Insured** | {f.get('insured_name', f.get('account', 'N/A'))} |
-| **LOB** | {f.get('lob', 'N/A')} |
-| **Policy** | {f.get('policy_number', 'N/A')} |
+| **Account** | {selected_file.get('account', 'N/A')} |
+| **Insured** | {selected_file.get('insured_name', selected_file.get('account', 'N/A'))} |
+| **LOB** | {selected_file.get('lob', 'N/A')} |
+| **Policy** | {selected_file.get('policy_number', 'N/A')} |
 | **Date Range** | {date_range} |
-| **Folder** | {f.get('folder_path', 'N/A')} |
+| **Folder** | {selected_file.get('folder_path', 'N/A')} |
 """)
-                    if st.button(f"Preview", key=f"prev_{idx}"):
-                        path = f.get('path', f.get('full_path', ''))
-                        if os.path.exists(path):
-                            text = preview_pdf(path)
-                            st.text_area("Preview", text, height=200)
-                        else:
-                            st.warning("File not found locally")
+                if st.button("Preview", key="prev_selected"):
+                    path = selected_file.get('path', selected_file.get('full_path', ''))
+                    if os.path.exists(path):
+                        text = preview_pdf(path)
+                        st.text_area("Preview", text, height=200)
+                    else:
+                        st.warning("File not found locally")
         
-        st.session_state['selected_agent_files'] = selected
+        st.session_state['selected_agent_files'] = [selected_file] if selected_file else []
         
         # Actions section
         st.markdown("---")
         st.subheader("Actions")
-        st.info(f"{len(selected)} document(s) selected")
+        st.info(f"Selected: {selected_file.get('filename')}" if selected_file else "No document selected")
         
-        # Email configuration section - show when documents are selected
-        if len(selected) > 0:
+        # Email configuration section - show when a document is selected
+        if selected_file:
             st.markdown("##### Email Recipients")
             
-            # Collect unique LOBs from selected files and their default emails
-            lob_emails_for_selected = {}
-            for f in selected:
-                lob = f.get('lob', 'UNKNOWN')
-                if lob not in lob_emails_for_selected:
-                    default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
-                    lob_emails_for_selected[lob] = default_email
+            # Get LOB and default email for the selected file
+            lob = selected_file.get('lob', 'UNKNOWN')
+            default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
             
-            # Create editable email inputs for each LOB
+            # Create editable email input for the LOB
             edited_emails = {}
-            for lob, default_email in lob_emails_for_selected.items():
-                col_lob, col_email = st.columns([1, 3])
-                with col_lob:
-                    st.markdown(f"**{lob}:**")
-                with col_email:
-                    edited_emails[lob] = st.text_input(
-                        f"Email for {lob}",
-                        value=default_email,
-                        key=f"email_{lob}",
-                        label_visibility="collapsed",
-                        placeholder="Enter email address(es), comma-separated"
-                    )
+            col_lob, col_email = st.columns([1, 3])
+            with col_lob:
+                st.markdown(f"**{lob}:**")
+            with col_email:
+                edited_emails[lob] = st.text_input(
+                    f"Email for {lob}",
+                    value=default_email,
+                    key=f"email_{lob}",
+                    label_visibility="collapsed",
+                    placeholder="Enter email address(es), comma-separated"
+                )
             
             # Additional recipients
             additional_emails = st.text_input(
@@ -821,20 +822,19 @@ def render_ai_agent_tab():
         col_email, col_parse, _ = st.columns([1, 1, 4])
         
         with col_email:
-            if st.button("Send Email", disabled=len(selected) == 0, type="primary"):
-                for f in selected:
-                    lob = f.get('lob', 'UNKNOWN')
-                    # Use the edited email if available
-                    recipient = edited_emails.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
-                    success, msg = send_email_action(f, lob, f.get('policy_number', ''), recipient_override=recipient)
-                    if success:
-                        st.toast(f"{f.get('filename')}: {msg}", icon="✅")
-                    else:
-                        st.error(f"{f.get('filename')}: {msg}")
+            if st.button("Send Email", disabled=not selected_file, type="primary"):
+                lob = selected_file.get('lob', 'UNKNOWN')
+                # Use the edited email if available
+                recipient = edited_emails.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
+                success, msg = send_email_action(selected_file, lob, selected_file.get('policy_number', ''), recipient_override=recipient)
+                if success:
+                    st.toast(f"{selected_file.get('filename')}: {msg}", icon="✅")
+                else:
+                    st.error(f"{selected_file.get('filename')}: {msg}")
         
         with col_parse:
             llm = get_llm()
-            if st.button("Parse PDF", disabled=len(selected) == 0 or not llm, type="primary"):
+            if st.button("Parse PDF", disabled=not selected_file or not llm, type="primary"):
                 if not llm:
                     st.error("OPENAI_API_KEY not set in .env")
                     return
@@ -842,19 +842,15 @@ def render_ai_agent_tab():
                 parse_results = []
                 all_parsed_results = []  # For Excel generation
                 
-                progress_bar = st.progress(0)
                 status_text = st.empty()
+                path = selected_file.get('path', selected_file.get('full_path', ''))
+                status_text.info(f"Parsing: {selected_file.get('filename')}")
                 
-                for idx, f in enumerate(selected):
-                    path = f.get('path', f.get('full_path', ''))
-                    status_text.info(f"Parsing: {f.get('filename')}")
-                    
-                    try:
-                        text = extract_text_from_pdf(path)
-                        if not text.strip():
-                            parse_results.append({"filename": f.get('filename'), "error": "No text"})
-                            continue
-                        
+                try:
+                    text = extract_text_from_pdf(path)
+                    if not text.strip():
+                        parse_results.append({"filename": selected_file.get('filename'), "error": "No text"})
+                    else:
                         lobs = classify_lobs(llm, text)
                         results = []
                         for lob in lobs:
@@ -870,20 +866,18 @@ def render_ai_agent_tab():
                                 'lob': lob,
                                 'carrier': fields.get('carrier', ''),
                                 'fields': fields,
-                                'source_file': f.get('filename')
+                                'source_file': selected_file.get('filename')
                             })
                         
                         parse_results.append({
-                            "filename": f.get('filename'),
-                            "file_info": f,  # Store file info for email
+                            "filename": selected_file.get('filename'),
+                            "file_info": selected_file,  # Store file info for email
                             "success": True,
                             "detected_lobs": lobs,
                             "results": results
                         })
-                    except Exception as e:
-                        parse_results.append({"filename": f.get('filename'), "error": str(e)})
-                    
-                    progress_bar.progress((idx + 1) / len(selected))
+                except Exception as e:
+                    parse_results.append({"filename": selected_file.get('filename'), "error": str(e)})
                 
                 status_text.success("Parsing complete!")
                 st.session_state['parse_results'] = parse_results
@@ -923,35 +917,31 @@ def render_ai_agent_tab():
                         type="primary"
                     )
             
-            # Email section for sending original PDFs and parsed Excel
+            # Email section for sending original PDF and parsed Excel
             parsed_files = st.session_state.get('parsed_files_for_email', [])
             if parsed_files:
+                parsed_file = parsed_files[0]  # Single file
                 st.markdown("---")
-                st.subheader("Send Documents via Email")
-                st.info(f"{len(parsed_files)} parsed document(s) ready to send (Original PDFs + Parsed Excel Report)")
+                st.subheader("Send Document via Email")
+                st.info(f"Parsed document ready to send: {parsed_file.get('filename')} (Original PDF + Parsed Excel Report)")
                 
-                # Collect unique LOBs and their emails
-                lob_emails_parsed = {}
-                for f in parsed_files:
-                    lob = f.get('lob', 'UNKNOWN')
-                    if lob not in lob_emails_parsed:
-                        default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
-                        lob_emails_parsed[lob] = default_email
+                # Get LOB and default email for the parsed file
+                lob = parsed_file.get('lob', 'UNKNOWN')
+                default_email = LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN', 'claims@company.com'))
                 
-                # Editable email inputs
+                # Editable email input
                 edited_emails_parsed = {}
-                for lob, default_email in lob_emails_parsed.items():
-                    col_lob, col_email = st.columns([1, 3])
-                    with col_lob:
-                        st.markdown(f"**{lob}:**")
-                    with col_email:
-                        edited_emails_parsed[lob] = st.text_input(
-                            f"Email for {lob} (parsed)",
-                            value=default_email,
-                            key=f"parsed_email_{lob}",
-                            label_visibility="collapsed",
-                            placeholder="Enter email address(es), comma-separated"
-                        )
+                col_lob, col_email = st.columns([1, 3])
+                with col_lob:
+                    st.markdown(f"**{lob}:**")
+                with col_email:
+                    edited_emails_parsed[lob] = st.text_input(
+                        f"Email for {lob} (parsed)",
+                        value=default_email,
+                        key=f"parsed_email_{lob}",
+                        label_visibility="collapsed",
+                        placeholder="Enter email address(es), comma-separated"
+                    )
                 
                 # CC Recipients
                 cc_emails_parsed = st.text_input(
@@ -969,7 +959,7 @@ def render_ai_agent_tab():
                     include_excel_report = st.checkbox("Include Parsed Excel Report", value=True, key="include_excel")
                 
                 # Send button
-                if st.button("Send Documents to LOB Emails", type="primary", key="send_parsed_emails"):
+                if st.button("Send Document to LOB Email", type="primary", key="send_parsed_emails"):
                     # Generate Excel data if needed
                     excel_data = None
                     excel_filename = None
@@ -979,29 +969,28 @@ def render_ai_agent_tab():
                             excel_data = create_excel_download(per_lob)
                             excel_filename = f"parsed_claims_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                     
-                    for f in parsed_files:
-                        lob = f.get('lob', 'UNKNOWN')
-                        recipient = edited_emails_parsed.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
-                        
-                        # Get PDF path if including original
-                        pdf_path = None
-                        if include_original_pdfs:
-                            pdf_path = f.get('path', f.get('full_path', ''))
-                        
-                        success, msg = send_email_action(
-                            f, 
-                            lob, 
-                            f.get('policy_number', ''), 
-                            recipient_override=recipient,
-                            cc_emails=cc_emails_parsed if cc_emails_parsed else None,
-                            excel_attachment=excel_data if include_excel_report else None,
-                            excel_filename=excel_filename,
-                            include_pdf=include_original_pdfs
-                        )
-                        if success:
-                            st.toast(f"{f.get('filename')}: {msg}", icon="✅")
-                        else:
-                            st.error(f"{f.get('filename')}: {msg}")
+                    lob = parsed_file.get('lob', 'UNKNOWN')
+                    recipient = edited_emails_parsed.get(lob, LOB_EMAILS.get(lob, LOB_EMAILS.get('UNKNOWN')))
+                    
+                    # Get PDF path if including original
+                    pdf_path = None
+                    if include_original_pdfs:
+                        pdf_path = parsed_file.get('path', parsed_file.get('full_path', ''))
+                    
+                    success, msg = send_email_action(
+                        parsed_file, 
+                        lob, 
+                        parsed_file.get('policy_number', ''), 
+                        recipient_override=recipient,
+                        cc_emails=cc_emails_parsed if cc_emails_parsed else None,
+                        excel_attachment=excel_data if include_excel_report else None,
+                        excel_filename=excel_filename,
+                        include_pdf=include_original_pdfs
+                    )
+                    if success:
+                        st.toast(f"{parsed_file.get('filename')}: {msg}", icon="✅")
+                    else:
+                        st.error(f"{parsed_file.get('filename')}: {msg}")
 
 # =============================================================================
 # Main
