@@ -50,3 +50,20 @@ def convert_pdf_to_text(pdf_bytes: bytes) -> str:
 
     except Exception as e:
         raise RuntimeError(f"PDF to text conversion failed: {e}")
+st.markdown("""
+<style>
+/* Preview button custom outline style */
+div[data-testid="stButton"] button[key="prev_selected"] {
+    border: 2px solid var(--primary-color);
+    color: var(--primary-color);
+    background-color: transparent;
+}
+
+/* Hover effect (optional but recommended) */
+div[data-testid="stButton"] button[key="prev_selected"]:hover {
+    background-color: rgba(0, 0, 0, 0.03);
+    color: var(--primary-color);
+    border-color: var(--primary-color);
+}
+</style>
+""", unsafe_allow_html=True)
